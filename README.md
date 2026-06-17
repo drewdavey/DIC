@@ -66,17 +66,25 @@ re-running this slower step.
 
 ## Level 3 — `DIC_Level3.py`
 
-Reads the Level-2 result CSVs, applies failure truncation and load
-scaling, computes ASTM D638 mechanical properties, and produces per-coupon
-and group plots/summaries.
+Reads the Level-2 result CSVs, applies failure truncation and a light
+rolling-median smoothing pass, computes ASTM D638 mechanical properties,
+and produces per-coupon and group plots/summaries.
 
 **What it does**
-- Scales `load_raw` to `force_N` (per-coupon `mts_peak_N / smoothed sync
-  peak`, falling back to a combined `SCALE_N_PER_UNIT`) and divides by
+- Scales raw `load_raw` to `force_N` — per-coupon `mts_peak_N / raw sync
+  peak`, falling back to a combined `SCALE_N_PER_UNIT` — and divides by
   `area_mm2` to get `stress_MPa`.
 - Truncates each record: drops pre-load slack (load < 2% of peak) and
   post-fracture rebound (first post-UTS frame where load < 50% of peak).
-- Median-filters strain/stress signals to remove spikes, then computes:
+- Smooths `force_N`/`stress_MPa`, `strain_axial`, and `strain_transverse`
+  with a rolling median (`MEDIAN_WINDOW` = 51 frames), applied only to this
+  truncated window. A median was chosen over a linear filter (e.g.
+  Butterworth) because it doesn't ring or systematically undershoot a sharp
+  peak the way averaging-based filters do — though some undershoot at UTS
+  is still possible if the window straddles into the retained post-fracture
+  decline; raise/lower `MEDIAN_WINDOW` if the plotted curve looks over- or
+  under-smoothed.
+- Computes, from this truncated, smoothed signal:
   - **Modulus E** (D638 §11.4) — slope of the linear region (0.05–0.3% strain).
   - **Toe compensation** (D638 Annex A1) — shifts strain origin using the
     modulus line's x-intercept.
@@ -93,15 +101,26 @@ and group plots/summaries.
 - `<FIGS_ROOT>/<coupon_id>/stress_strain_DIC.png` — per-coupon σ-ε curve
   (toe-corrected, truncated at UTS) with modulus/yield/UTS markers.
 - `<FIGS_ROOT>/<coupon_id>/poisson_DIC.png` — per-coupon −ε_xx vs ε_yy plot.
-- `<DIC_DIR>/<coupon_id>_L3.csv` — per-frame processed signals (smoothed,
-  toe-corrected) plus scalar properties, for downstream MATLAB group plots.
+- `<DIC_DIR>/<coupon_id>_L3.csv` — per-frame signals only (`step, eps, sig,
+  eps_t, i_uts`), for downstream MATLAB group plots. Scalar properties are
+  *not* repeated here — they live once per coupon in `level3_summary.csv`
+  and in `SPECIMEN_SHEET` (see below).
 - `<FIGS_ROOT>/level3_summary.csv` (also written to `DIC_DIR`) — one row
   per coupon with all computed properties.
 - `<FIGS_ROOT>/level3_group_stats.csv` (also written to `DIC_DIR`) — mean/
   std/count per (exposure, direction) group.
+- `FSR-SpecimenTesting.xlsx` (`SPECIMEN_SHEET`) — each coupon's scalar
+  properties (E, toe strain, yield stress/strain, UTS, strain at UTS,
+  Poisson's ratio) are written into new columns on that coupon's existing
+  row, matched by Specimen ID. Only those columns are touched — other
+  rows, formulas, and formatting in the workbook are left alone. If the
+  file is open elsewhere when Level 3 runs, this step is skipped with a
+  warning rather than failing the whole run.
 
 Group overlay plots (`tensile_curves_DIC.png`, `tensile_summary_DIC.png`)
-are produced separately by `tensile_group_plots.py`.
+are produced separately by `tensile_group_plots.py`, which (like
+`matlab/tensile_plots.m`) now reads scalar properties from
+`level3_summary.csv` rather than from the per-frame `_L3.csv` files.
 
 ---
 

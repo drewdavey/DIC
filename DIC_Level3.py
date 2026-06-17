@@ -15,11 +15,13 @@ Standards compliance — what each calculation cites
   Group statistics     : D638 §11.7 / §12.1   (mean, std per series)
 
 PLOTTING NOTE
-  Per-coupon plots are truncated at UTS so post-fracture rebound (which
-  appears as the curve doubling back) is not shown. Level-2 already cuts
-  the data at 50% post-UTS load drop; Level-3 cuts it again at exactly UTS
-  for the σ-ε figure and for Poisson, since post-UTS data violates the
-  monotonic-loading assumption D638 calculations rely on.
+  Level-2 writes the full, untruncated DIC record (see its docstring). All
+  failure truncation happens here via truncate_df(): pre-load slack and
+  post-fracture rebound (past 50% post-UTS load drop) are cut, then
+  per-coupon plots are truncated again at exactly UTS so post-fracture
+  rebound (which appears as the curve doubling back) is never shown, since
+  post-UTS data violates the monotonic-loading assumption D638 calculations
+  rely on.
 
 OUTPUT
   {FIGS_ROOT}/{coupon_id}/stress_strain_DIC.png   per-coupon σ–ε (toe-corrected, to UTS)
@@ -41,7 +43,7 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 from scipy.ndimage import median_filter
-from scipy.interpolate import PchipInterpolator
+import openpyxl
 
 # =============================================================================
 # PATHS
@@ -58,14 +60,20 @@ FIGS_ROOT = Path(
     r"\P01-LT150-LH4.5\figs"
 )
 DIC_DIR = FIGS_ROOT.parent / "DIC"   # consolidated _L2.csv files written by Level 2
+SPECIMEN_SHEET = Path(
+    r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+)
 
 # =============================================================================
 # SWITCHES
 # =============================================================================
 PRINTS     = ["P01"]
 EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
-DIRECTIONS = {"00": True, "45": True, "90": True}
-REPLICATES = ["01", "02", "03"]
+# DIRECTIONS = {"00": True, "45": True, "90": True}
+DIRECTIONS = {"00": True, "45": False, "90": False}
+# REPLICATES = ["01", "02", "03"]
+REPLICATES = ["01"]
 
 # =============================================================================
 # FAILURE TRUNCATION  — applied to Level-2 data before property extraction
@@ -77,8 +85,8 @@ LOAD_END_FRAC   = 0.50     # post-fracture: cut first post-UTS frame where load 
 
 # Scale factor applied to load_raw to produce force_N (N per sync-CSV unit).
 # Two modes — the first one found is used:
-#   1. Per-coupon  : mts_peak_N / max(smooth(load_raw))  — most accurate
-#   2. Combined    : SCALE_N_PER_UNIT below               — fallback if mts_peak_N missing
+#   1. Per-coupon  : mts_peak_N / max(raw load_raw)  — most accurate
+#   2. Combined    : SCALE_N_PER_UNIT below          — fallback if mts_peak_N missing
 # Set SCALE_N_PER_UNIT to the mean reported by Level-2's calibration pass.
 SCALE_N_PER_UNIT: float = 555.5928
 
@@ -100,17 +108,22 @@ YIELD_OFFSET = 0.002
 POISSON_RANGE = (0.0005, 0.0025)
 POISSON_CHORD_AT = 0.002
 
-# =============================================================================
-# SMOOTHING  (median filter)
-# Median filter removes voltage spikes.
-# Window must be odd. Increase SMOOTH_WIN for noisier data.
-# =============================================================================
-SMOOTH_WIN   = 51  # frames — median kernel for strain and stress signals
-N_DOWNSAMPLE = 10  # knots for PCHIP spline fit used in plots
-
 # Airtech reference values (printed material spec — comparison lines)
 AIRTECH_UTS = {0: 79.3, 45: None, 90: 25.9}    # MPa
 AIRTECH_E   = {0: 6.6,  45: None, 90: 3.7}     # GPa
+
+# Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
+# ("Specimen ID") — maps the property dict key to the Excel column header.
+SPECIMEN_SHEET_COLUMNS = {
+    "E_GPa":         "E (GPa)",
+    "eps_toe":       "Toe Strain",
+    "sigma_y_MPa":   "Yield Stress (MPa)",
+    "eps_y":         "Yield Strain",
+    "UTS_MPa":       "UTS (MPa)",
+    "eps_at_UTS":    "Strain at UTS",
+    "poisson_chord": "Poisson's Ratio (chord)",
+    "poisson_slope": "Poisson's Ratio (slope)",
+}
 
 # =============================================================================
 # DISPLAY
@@ -140,84 +153,83 @@ def find_l2(cid):
     p = DIC_DIR / f"{cid}_L2.csv"
     return p if p.exists() else None
 
-def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove pre-load slack and post-fracture frames (Level-3 failure truncation).
-
-    Peak finding uses the smoothed force signal so a single voltage spike cannot
-    be misidentified as UTS. The raw (unsmoothed) data is what gets sliced and
-    returned — smoothing is only used to locate the window boundaries.
+def write_specimen_sheet(rows: list[dict]) -> None:
+    """Write each coupon's scalar properties into its row in SPECIMEN_SHEET,
+    matched by Specimen ID. Adds any missing property columns at the end;
+    everything else in the workbook (other rows, formulas, formatting) is
+    left untouched. Skipped (with a warning) if the file can't be opened —
+    e.g. if it's currently open in Excel.
     """
+    try:
+        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
+    except FileNotFoundError:
+        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
+        return
+    ws = wb.active
+
+    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
+    id_col = header.get("Specimen ID")
+    if id_col is None:
+        print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
+        return
+
+    next_col = ws.max_column + 1
+    for label in SPECIMEN_SHEET_COLUMNS.values():
+        if label not in header:
+            ws.cell(row=1, column=next_col, value=label)
+            header[label] = next_col
+            next_col += 1
+
+    row_by_id = {ws.cell(row=r, column=id_col).value: r
+                 for r in range(2, ws.max_row + 1)}
+
+    for row in rows:
+        r = row_by_id.get(row["coupon"])
+        if r is None:
+            continue
+        for key, label in SPECIMEN_SHEET_COLUMNS.items():
+            v = row.get(key)
+            v = None if (v is None or not np.isfinite(v)) else v
+            ws.cell(row=r, column=header[label], value=v)
+
+    try:
+        wb.save(SPECIMEN_SHEET)
+    except PermissionError:
+        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+
+def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove pre-load slack and post-fracture frames (Level-3 failure truncation)."""
     f = df["force_N"].to_numpy()
-    f_smooth = smooth_signal(np.abs(f))   # spike-resistant peak location
-    peak = float(np.nanmax(f_smooth))
+    peak = float(np.nanmax(np.abs(f)))
     if peak <= 0:
         return df
-    i_uts = int(np.nanargmax(f_smooth))
-    starts = np.where(f_smooth > LOAD_START_FRAC * peak)[0]
+    i_uts = int(np.nanargmax(np.abs(f)))
+    starts = np.where(np.abs(f) > LOAD_START_FRAC * peak)[0]
     i0 = int(starts[0]) if len(starts) else 0
-    post = np.where(f_smooth[i_uts:] < LOAD_END_FRAC * peak)[0]
+    post = np.where(np.abs(f[i_uts:]) < LOAD_END_FRAC * peak)[0]
     i1 = int(i_uts + post[0]) if len(post) else len(f) - 1
     return df.iloc[i0:i1 + 1].reset_index(drop=True)
 
 
 # =============================================================================
-# SIGNAL SMOOTHER
+# SMOOTHING  (rolling median)
+# Window must be odd. Raise MEDIAN_WINDOW for noisier data.
 # =============================================================================
+MEDIAN_WINDOW = 11  # frames
+
 def smooth_signal(x):
-    """Median filter; NaN gaps are bridged by linear
-    interpolation before filtering, then the original NaN positions are restored.
-    mode='nearest' avoids the zero-padding edge artifacts scipy.signal.medfilt has."""
+    """Rolling median. mode='nearest' avoids the zero-padding edge artifacts
+    scipy.signal.medfilt has."""
     x = np.asarray(x, dtype=float)
-    n = len(x)
-    win = SMOOTH_WIN
-    if win >= n:
-        win = n if n % 2 == 1 else n - 1
+    win = MEDIAN_WINDOW
     if win % 2 == 0:
         win -= 1
-    if win < 1 or n < win:
+    if win < 1 or len(x) < win:
         return x.copy()
-    nan_mask = ~np.isfinite(x)
-    if nan_mask.all():
-        return x.copy()
-    xi = x.copy()
-    if nan_mask.any():
-        idx = np.arange(n)
-        xi[nan_mask] = np.interp(idx[nan_mask], idx[~nan_mask], x[~nan_mask])
-    out = median_filter(xi, size=win, mode='nearest')
-    out[nan_mask] = np.nan
-    return out
-
+    return median_filter(x, size=win, mode="constant", cval=np.nan)
 
 # =============================================================================
-# PCHIP SPLINE FIT FOR PLOTTING
-# =============================================================================
-def dic_spline_fit(x_raw, y_raw, i_uts, raw_uts_MPa=np.nan):
-    """
-    Bin-average (x, y) to N_DOWNSAMPLE representative knots, force the raw UTS
-    as the last knot, fit a PCHIP spline, return 300-point smooth arrays.
-    Used for plotting only — property calculations use the median-filtered arrays.
-    x and y are in their natural units (fractional strain, MPa, etc.).
-    raw_uts_MPa: max(load_raw)*scale/area — the true signal peak, passed in from
-    main() so the plotted curve passes through the actual load-cell UTS.
-    """
-    n    = i_uts + 1
-    bins = np.array_split(np.arange(n), min(N_DOWNSAMPLE - 1, n))
-    x_k  = np.array([x_raw[b].mean() for b in bins if len(b)])
-    y_k  = np.array([y_raw[b].mean() for b in bins if len(b)])
-    x_k[-1] = x_raw[i_uts]
-    y_k[-1] = float(raw_uts_MPa) if np.isfinite(raw_uts_MPa) else y_raw[i_uts]
-    order = np.argsort(x_k)
-    x_k, y_k = x_k[order], y_k[order]
-    _, uniq = np.unique(np.round(x_k, 7), return_index=True)
-    x_k, y_k = x_k[uniq], y_k[uniq]
-    if len(x_k) < 2:
-        return x_raw[:n].copy(), y_raw[:n].copy()
-    x_fine = np.linspace(x_k[0], x_k[-1], 300)
-    return x_fine, PchipInterpolator(x_k, y_k)(x_fine)
-
-
-# =============================================================================
-# COMPUTE PROPERTIES 
+# COMPUTE PROPERTIES
 # =============================================================================
 def compute_properties(df):
     """
@@ -233,15 +245,17 @@ def compute_properties(df):
     if len(df) < 10:
         return None
 
-    eps_raw   = smooth_signal(df["strain_axial"].to_numpy())
+    eps_raw   = df["strain_axial"].to_numpy()
     sig       = df["stress_MPa"].to_numpy()
-    eps_t_raw = smooth_signal(
-        df["strain_transverse"].to_numpy()
-        if "strain_transverse" in df.columns
-        else np.full_like(eps_raw, np.nan)
-    )
+    eps_t_raw = (df["strain_transverse"].to_numpy()
+                 if "strain_transverse" in df.columns
+                 else np.full_like(eps_raw, np.nan))
+    # Pre-smoothing reference, carried through only for the diagnostic
+    # overlay in plot_stress_strain() — not used in any property calculation.
+    eps_unsmoothed = df["strain_axial_raw"].to_numpy() if "strain_axial_raw" in df.columns else None
+    sig_unsmoothed = df["stress_MPa_raw"].to_numpy()   if "stress_MPa_raw"   in df.columns else None
 
-    # ---- 1. Modulus from raw curve (D638 §11.4) -----------------------------
+    # ---- 1. Modulus (D638 §11.4) --------------------------------------------
     lo, hi = MODULUS_STRAIN_RANGE
     mfit = (eps_raw >= lo) & (eps_raw <= hi) & np.isfinite(eps_raw) & np.isfinite(sig)
     if mfit.sum() < 3:
@@ -249,12 +263,13 @@ def compute_properties(df):
     slope, intercept = np.polyfit(eps_raw[mfit], sig[mfit], 1)
     E_MPa = float(slope)
 
-    # ---- 2. Toe compensation (D638 Annex A1) -------------------------------
+    # ---- 2. Toe compensation (D638 Annex A1) --------------------------------
     # The fitted line σ = E·ε + b is extended back to σ = 0; that strain
     # (b/(-E)) is the "toe offset" — all strains are then measured from the
     # corrected origin. ε_corrected = ε_raw − ε_offset.
     eps_offset = -intercept / E_MPa if E_MPa != 0 else 0.0
     eps   = eps_raw   - eps_offset
+    eps_unsmoothed_corr = (eps_unsmoothed - eps_offset) if eps_unsmoothed is not None else None
     # Transverse strain: subtract its value at the corrected zero of axial strain.
     # Find the index where corrected axial ≈ 0 and subtract that ε_t.
     if np.any(np.isfinite(eps_t_raw)):
@@ -263,12 +278,12 @@ def compute_properties(df):
     else:
         eps_t = eps_t_raw.copy()
 
-    # ---- 3. UTS (D638 §11.2 — max stress) ----------------------------------
+    # ---- 3. UTS (D638 §11.2 — max stress) -----------------------------------
     i_uts   = int(np.nanargmax(sig))
     uts     = float(sig[i_uts])
     eps_ult = float(eps[i_uts])
 
-    # ---- 4. 0.2% offset yield (D638 §A2.6, Fig. A2.1) ----------------------
+    # ---- 4. 0.2% offset yield (D638 §A2.6, Fig. A2.1) -----------------------
     # First crossing of σ-ε curve with the line σ = E·(ε − YIELD_OFFSET).
     sigma_y, eps_y = np.nan, np.nan
     diff  = sig - E_MPa * (eps - YIELD_OFFSET)
@@ -297,11 +312,6 @@ def compute_properties(df):
         if ea[0] <= POISSON_CHORD_AT <= ea[-1]:
             nu_chord = float(-np.interp(POISSON_CHORD_AT, ea, et) / POISSON_CHORD_AT)
 
-    # PCHIP spline for plotting — last knot pinned to raw load-cell UTS
-    _raw_uts  = float(df["raw_uts_MPa"].iloc[0]) if "raw_uts_MPa" in df.columns else np.nan
-    _eps_plot, _sig_plot = dic_spline_fit(eps, sig, i_uts, _raw_uts)
-    _sig_plot = np.clip(_sig_plot, 0.0, None)
-
     return {
         "E_GPa":         E_MPa / 1000.0,
         "eps_toe":       eps_offset,
@@ -311,12 +321,12 @@ def compute_properties(df):
         "eps_at_UTS":    eps_ult,
         "poisson_chord": nu_chord,
         "poisson_slope": nu_slope,
-        "_eps":          eps,        # toe-corrected SG, used in property calcs
+        "_eps":          eps,        # toe-corrected strain, used in property calcs
         "_sig":          sig,
         "_eps_t":        eps_t,
         "_i_uts":        i_uts,
-        "_eps_plot":     _eps_plot,  # PCHIP spline, for plotting only
-        "_sig_plot":     _sig_plot,
+        "_eps_raw":      eps_unsmoothed_corr,  # diagnostic overlay only
+        "_sig_raw":      sig_unsmoothed,
     }
 
 
@@ -324,16 +334,28 @@ def compute_properties(df):
 # PER-COUPON PLOTS
 # =============================================================================
 def plot_stress_strain(cid, props, fig_dir):
-    """σ-ε curve, toe-corrected, truncated at UTS."""
+    """σ-ε curve, toe-corrected, truncated at UTS. The raw (pre-smoothing,
+    but still truncated) signal is drawn behind it in light gray, with its
+    own peak marked, for comparison."""
     exp, d_str = parse_id(cid)
     direction  = int(d_str)
 
-    # Use PCHIP spline for the plotted curve (already truncated at UTS)
-    e_p = props["_eps_plot"] * 100   # % strain
-    s_p = props["_sig_plot"]
+    sl  = slice(0, props["_i_uts"] + 1)
+    e_p = props["_eps"][sl] * 100   # % strain
+    s_p = props["_sig"][sl]
 
     fig, ax = plt.subplots(figsize=(7, 4.8))
-    ax.plot(e_p, s_p, lw=1.4, color=EXPOSURE_COLORS.get(exp, "#333"), label=cid)
+
+    eps_r, sig_r = props.get("_eps_raw"), props.get("_sig_raw")
+    if eps_r is not None and sig_r is not None and np.any(np.isfinite(sig_r)):
+        ax.plot(eps_r * 100, sig_r, lw=0.8, color="0.8", zorder=1,
+                label="raw (unsmoothed)")
+        i_raw = int(np.nanargmax(sig_r))
+        ax.plot(eps_r[i_raw] * 100, sig_r[i_raw], "^", color="0.6", ms=8,
+                zorder=2, label=f"raw UTS = {sig_r[i_raw]:.1f} MPa")
+
+    ax.plot(e_p, s_p, lw=1.4, color=EXPOSURE_COLORS.get(exp, "#333"),
+            label=cid, zorder=3)
 
     E_MPa = props["E_GPa"] * 1000.0
     if np.isfinite(E_MPa):
@@ -372,7 +394,6 @@ def plot_stress_strain(cid, props, fig_dir):
     fig.savefig(out, dpi=600, bbox_inches="tight")
     plt.close(fig)
     return out
-
 
 def plot_poisson(cid, props, fig_dir):
     """−ε_xx vs ε_yy, truncated at UTS."""
@@ -428,26 +449,37 @@ def main():
         df = pd.read_csv(l2)
 
         if "load_raw" in df.columns:
-            # Current L2 format: smooth raw voltage first, then scale
-            load_smooth = smooth_signal(df["load_raw"].to_numpy())
-            smooth_peak = float(np.nanmax(np.abs(load_smooth)))
-            if "mts_peak_N" in df.columns and smooth_peak > 0:
-                # Per-coupon scale: each coupon's own MTS peak / its own smoothed sync peak
+            # Current L2 format: scale from raw peaks (mirrors Level-2's own
+            # calibration pass).
+            raw_peak = float(np.nanmax(np.abs(df["load_raw"].to_numpy())))
+            if "mts_peak_N" in df.columns and raw_peak > 0:
+                # Per-coupon scale: each coupon's own MTS peak / its own raw sync peak
                 mts_peak = float(df["mts_peak_N"].iloc[0])
-                scale = mts_peak / smooth_peak
+                scale = mts_peak / raw_peak
                 print(f"[{cid}] per-coupon scale: {scale:.4f} N/unit  "
                       f"(MTS {mts_peak:.0f} N)")
             else:
                 scale = SCALE_N_PER_UNIT
                 print(f"[{cid}] combined scale: {scale:.4f} N/unit")
             area = float(df["area_mm2"].iloc[0]) if "area_mm2" in df.columns else np.nan
-            df["force_N"]      = load_smooth * scale
-            df["stress_MPa"]   = df["force_N"] / area if np.isfinite(area) else np.nan
-            raw_peak_N         = float(np.nanmax(np.abs(df["load_raw"].to_numpy()))) * scale
-            df["raw_uts_MPa"]  = raw_peak_N / area if np.isfinite(area) else np.nan
+            df["force_N"]    = df["load_raw"].to_numpy() * scale
+            df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
         # else: old L2 CSV already has force_N / stress_MPa — use as-is
 
         df = truncate_df(df)
+
+        # Keep pre-smoothing copies (still truncated) for the gray
+        # diagnostic overlay on the plot.
+        df["stress_MPa_raw"]   = df["stress_MPa"]
+        df["strain_axial_raw"] = df["strain_axial"]
+
+        area = float(df["area_mm2"].iloc[0]) if "area_mm2" in df.columns else np.nan
+        df["force_N"]      = smooth_signal(df["force_N"].to_numpy())
+        df["stress_MPa"]   = df["force_N"] / area if np.isfinite(area) else np.nan
+        df["strain_axial"] = smooth_signal(df["strain_axial"].to_numpy())
+        if "strain_transverse" in df.columns:
+            df["strain_transverse"] = smooth_signal(df["strain_transverse"].to_numpy())
+
         p = compute_properties(df)
         props_by_cid[cid] = p
 
@@ -464,19 +496,16 @@ def main():
             plot_poisson(cid, p, fig_dir)
 
             # ---- write _L3.csv to DIC_DIR for MATLAB group figures -------
-            # Per-frame signals (processed: smoothed, toe-corrected) plus
-            # scalar properties as constant columns. MATLAB reads one file
-            # per coupon and has everything for group plots and stats without
-            # re-running the pipeline.
+            # Per-frame signals only (toe-corrected). Scalar properties are
+            # NOT repeated here — they live once per coupon in
+            # level3_summary.csv and in SPECIMEN_SHEET (see write_specimen_sheet).
             n_frames = len(p["_eps"])
-            scalar = {k: v for k, v in p.items() if not k.startswith("_")}
             pd.DataFrame({
-                "step":          np.arange(n_frames),
-                "eps":           p["_eps"],
-                "sig":           p["_sig"],
-                "eps_t":         p["_eps_t"],
-                "i_uts":         p["_i_uts"],
-                **{k: scalar[k] for k in scalar},
+                "step":  np.arange(n_frames),
+                "eps":   p["_eps"],
+                "sig":   p["_sig"],
+                "eps_t": p["_eps_t"],
+                "i_uts": p["_i_uts"],
             }).to_csv(DIC_DIR / f"{cid}_L3.csv", index=False, float_format="%.6g")
 
             # store summary row (drop internal arrays)
@@ -499,6 +528,8 @@ def main():
                        .agg(["mean", "std", "count"]))
         for dest in (FIGS_ROOT, DIC_DIR):
             group.to_csv(dest / "level3_group_stats.csv")
+
+        write_specimen_sheet(rows)
 
         # Group figures moved to tensile_group_plots.py
         print(f"\nCSVs written -> {FIGS_ROOT}  (run tensile_group_plots.py for group figures)")
