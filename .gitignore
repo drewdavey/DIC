@@ -1,5 +1,6 @@
 *
 !.gitignore
+!README.md
 !DIC_Level1.py
 !DIC_Level2.py
 !DIC_Level3.py
