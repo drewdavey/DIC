@@ -2,92 +2,121 @@
 """
 DIC_Level2.py  —  FSR Tensile Coupons
 ======================================
-Pairs per-frame DIC data (Level-1 CSVs) with force/displacement,
-inserts virtual axial + transverse extensometers, and writes one compact
-result CSV per coupon (full untruncated record). Also saves a raw
-MTS force-displacement plot (relative displacement) to figs.
+Reads Level-1 per-coupon CSVs, scales raw load to force/stress, applies
+failure truncation and a light rolling-median smoothing pass, and computes
+ASTM D638 mechanical properties. No plotting here — see DIC_Level3.py.
 
-No truncation is applied here — the full DIC record is preserved so that
-Level-3 can apply (and tune) failure truncation independently.
+Standards compliance — what each calculation cites
+  Toe compensation     : D638 Annex A1 (mandatory unless toe is real material response)
+  Modulus              : D638 §11.4   (slope of initial linear region of σ-ε)
+  0.2 % offset yield    : D638 §A2.6 / Fig. A2.1 (offset from toe-corrected origin)
+  Tensile strength UTS  : D638 §11.2   (max stress / original area)
+  Poisson's ratio       : D638 Annex A3.10.1.3 (chord at ε_a=0.002 over 0.0005-0.0025)
+  Group statistics      : D638 §11.7 / §12.1   (mean, std per series)
 
-INPUT per coupon
-  <coupon_dir>/<coupon_id>.csv          VIC sync CSV (analog channels @ DIC frame rate)
-  <coupon_dir>/<coupon_id>-*.csv        per-frame full-field DIC CSVs (Level 1 output)
-  <MTS_DIR>/<coupon_id>*.txt            MTS raw file: cols disp_mm, force_N, output_V, time_s
-  FSR-SpecimenTesting.xlsx              gauge thickness × width  →  area
+PROCESSING NOTE
+  Level-1 writes the full, untruncated record (see its docstring). All
+  failure truncation happens here via truncate_df(): pre-load slack and
+  post-fracture rebound (past 50% post-UTS load drop) are cut. Properties
+  are computed from this truncated, smoothed window; pre-smoothing values
+  (still truncated) are kept alongside for Level-3's diagnostic overlay.
 
 OUTPUT per coupon
-  <DIC_DIR>/<coupon_id>_L2.csv          step, time_s, force_N, disp_mm,
-                                        stress_MPa, strain_axial, strain_transverse
-  <FIGS_ROOT>/<coupon_id>/MTS_force_disp.png    raw MTS curve (sanity check)
-
-UNIT NOTES
-  MTS .txt is already in mm / N / V / sec (verified against tensile_analysis.py).
-  VIC sync CSV "Load" column units are device-dependent; rather than guess,
-  we use a combined scale factor (SCALE_N_PER_UNIT) derived from all coupons.
+  <DIC_DIR>/<coupon_id>_L2.csv   step, eps, sig, eps_t, i_uts, eps_raw, sig_raw
+                                 (eps/sig/eps_t are toe-corrected + smoothed;
+                                  eps_raw/sig_raw are the same window pre-smoothing)
+  FSR-SpecimenTesting.xlsx       scalar properties written into each coupon's
+                                 row (E, toe strain, yield stress/strain, UTS,
+                                 strain at UTS, Poisson's ratio) — the single
+                                 source of truth for per-coupon scalars used
+                                 by Level-3 and the group-plot scripts.
+  <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
 from __future__ import annotations
+import sys
 import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from scipy.ndimage import median_filter
+import openpyxl
+
+sys.stdout.reconfigure(encoding="utf-8")
 
 # =============================================================================
 # PATHS
 # =============================================================================
-DATA_ROOTS = {
-    "CL": Path(r"G:\DrewDavey\2026_FSR_TensileTest_TCL"),
-    "SW": Path(r"G:\DrewDavey\2026_FSR_TensileTest_TSW_TIS_TUV"),
-    "UV": Path(r"G:\DrewDavey\2026_FSR_TensileTest_TSW_TIS_TUV"),
-    "IS": Path(r"G:\DrewDavey\2026_FSR_TensileTest_TSW_TIS_TUV"),
-}
-MTS_DIR = Path(
+DIC_DIR = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
-    r"\P01-LT150-LH4.5\MTS"
+    r"\P01-LT150-LH4.5\DIC"
 )
-DIC_DIR = MTS_DIR.parent / "DIC"   # consolidated _L2.csv files land here
 SPECIMEN_SHEET = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
-)
-FIGS_ROOT = Path(
-    r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
-    r"\P01-LT150-LH4.5\figs"
 )
 
 # =============================================================================
 # SWITCHES
 # =============================================================================
 PRINTS     = ["P01"]
-EXPOSURES  = {"CL": True, "SW": True, "UV": True, "IS": True}
+EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
-OVERWRITE  = True
 
 # =============================================================================
-# VIRTUAL EXTENSOMETER  — ASTM D638 §5.2.1 (Class B-2 equivalent for modulus)
-# Gauge length 50 mm (2 in) per D638 Type I Fig. 1.
+# FAILURE TRUNCATION  — applied to Level-1 data before property extraction
+# Trim pre-load slack and post-fracture rebound so only the valid test window
+# is passed to compute_properties.
 # =============================================================================
-AXIAL_GAUGE_IN = 4.36       # axial (Y, loading) gauge length, inches  [D638 G = 2.00 in]
-TRANS_GAUGE_IN = 1.0       # transverse (X) gauge length, inches      [Annex A3.5.2]
+LOAD_START_FRAC = 0.02     # pre-load: drop frames before load exceeds this × peak
+LOAD_END_FRAC   = 0.50     # post-fracture: cut first post-UTS frame where load < this × peak
+
+# Scale factor applied to load_raw to produce force_N (N per sync-CSV unit).
+# Two modes — the first one found is used:
+#   1. Per-coupon  : mts_peak_N / max(raw load_raw)  — most accurate, always
+#                    available since Level-1 always writes mts_peak_N
+#   2. Combined    : SCALE_N_PER_UNIT below          — fallback safety net
+SCALE_N_PER_UNIT: float = 555.5928
 
 # =============================================================================
-# CONSTANTS
+# PROPERTY SETTINGS
 # =============================================================================
-IN2MM    = 25.4
-HEADERS  = 8               # MTS .txt has an 8-line header (verified)
+# Modulus fit window (axial strain, dimensionless).
+# D638 §11.4: "initial linear portion of the load-extension curve".
+# A window of 0.05–0.3% covers the typical linear region for stiff polymers
+# and composites without including the toe. Adjust if the fit line on the
+# generated plot doesn't sit on the linear segment.
+MODULUS_STRAIN_RANGE = (0.0005, 0.003)
 
-# Scaling is intentionally NOT applied in Level-2. The raw sync voltage
-# (load_raw) is saved to the L2 CSV alongside mts_peak_N and area_mm2 so
-# that Level-3 can: smooth → scale → truncate, without re-running Level-2.
-# The calibration pass below reports per-coupon scale factors for reference;
-# set SCALE_N_PER_UNIT in Level-3 once you have a stable value.
+# D638 §A2.6 — 0.2% offset yield strength
+YIELD_OFFSET = 0.002
+
+# D638 §A3.10.1.3 — Poisson chord method window (when no clear proportionality)
+# Chord computed at ε_a = 0.002 over the range 0.0005 to 0.0025 strain.
+POISSON_RANGE = (0.0005, 0.0025)
+POISSON_CHORD_AT = 0.002
+
+# Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
+# ("Specimen ID") — maps the property dict key to the Excel column header.
+# Level-3 and the group-plot scripts read these same headers back out.
+SPECIMEN_SHEET_COLUMNS = {
+    "E_GPa":         "E (GPa)",
+    "eps_toe":       "Toe Strain",
+    "sigma_y_MPa":   "Yield Stress (MPa)",
+    "eps_y":         "Yield Strain",
+    "UTS_MPa":       "UTS (MPa)",
+    "eps_at_UTS":    "Strain at UTS",
+    "poisson_chord": "Poisson's Ratio (chord)",
+    "poisson_slope": "Poisson's Ratio (slope)",
+}
+
+# =============================================================================
+# SMOOTHING  (rolling median)
+# Window must be odd. Raise MEDIAN_WINDOW for noisier data.
+# =============================================================================
+MEDIAN_WINDOW = 11  # frames
 
 # =============================================================================
 # HELPERS
@@ -101,252 +130,189 @@ def selected_coupons():
             for d, on2 in DIRECTIONS.items() if on2
             for r in REPLICATES]
 
-def coupon_dir(cid):
-    exp = cid.split("-")[1][1:-2]
-    return DATA_ROOTS[exp] / cid
+def parse_id(cid):
+    """Return (exposure, direction_str) e.g. ('CL', '00')."""
+    part = cid.split("-")[1]
+    return part[1:-2], part[-2:]
 
-def find_first(paths):
-    for p in paths:
-        if p.exists():
-            return p
-    return None
+def find_l1(cid):
+    p = DIC_DIR / f"{cid}_L1.csv"
+    return p if p.exists() else None
 
-def find_mts_txt(cid):
-    p = find_first([MTS_DIR / f"{cid}.txt", MTS_DIR / f"{cid}-TEST.txt"])
-    if p is None:
-        hits = sorted(MTS_DIR.glob(f"{cid}*.txt"))
-        p = hits[0] if hits else None
-    return p
+def smooth_signal(x):
+    """Rolling median. mode='nearest' avoids the zero-padding edge artifacts
+    scipy.signal.medfilt has."""
+    x = np.asarray(x, dtype=float)
+    win = MEDIAN_WINDOW
+    if win % 2 == 0:
+        win -= 1
+    if win < 1 or len(x) < win:
+        return x.copy()
+    return median_filter(x, size=win, mode="constant", cval=np.nan)
 
-def find_sync_csv(cdir, cid):
-    return find_first([cdir / f"{cid}.csv"])
-
-def find_frame_csvs(cdir, cid):
-    return sorted(cdir.glob(f"{cid}-????????_0.csv"))
-
-def pick_col(df, hint):
-    for c in df.columns:
-        if hint.lower() in c.lower():
-            return c
-    return None
-
-def load_mts_txt(fp):
-    """MTS .txt: 8-line header, then tab-separated cols disp_mm, force_N, output_V, time_s."""
-    return (pd.read_csv(fp, sep="\t", skiprows=HEADERS, header=None,
-                        names=["disp_mm", "force_N", "output_V", "time_s"],
-                        encoding="utf-8-sig", on_bad_lines="skip")
-              .apply(pd.to_numeric, errors="coerce")
-              .dropna(subset=["force_N"]))
-
-def load_specimen_sheet():
-    df = pd.read_excel(SPECIMEN_SHEET)
-    t_col = next((c for c in df.columns if "thickness" in c.lower()), None)
-    w_col = next((c for c in df.columns if "width" in c.lower() and "dia" in c.lower()), None)
-    if t_col is None or w_col is None:
-        raise RuntimeError(f"could not find thickness/width cols in {SPECIMEN_SHEET}")
-    df = df.rename(columns={t_col: "t_in", w_col: "w_in"})
-    return df.set_index("Specimen ID")
-
-def compute_scale_factor(cid) -> float | None:
-    """Return N-per-sync-unit scale factor for cid, or None on any failure."""
-    cdir = coupon_dir(cid)
-    sync_fp = find_sync_csv(cdir, cid)
-    mts_fp  = find_mts_txt(cid)
-    if sync_fp is None or mts_fp is None:
-        return None
+def write_specimen_sheet(rows: list[dict]) -> None:
+    """Write each coupon's scalar properties into its row in SPECIMEN_SHEET,
+    matched by Specimen ID. Adds any missing property columns at the end;
+    everything else in the workbook (other rows, formulas, formatting) is
+    left untouched. Skipped (with a warning) if the file can't be opened —
+    e.g. if it's currently open in Excel.
+    """
     try:
-        mts = load_mts_txt(mts_fp)
-        peak_N = float(mts["force_N"].abs().max())
-        sync = pd.read_csv(sync_fp)
-        load_col = pick_col(sync, "load")
-        if load_col is None:
-            return None
-        load_raw = pd.to_numeric(sync[load_col], errors="coerce").to_numpy()
-        raw_peak = float(np.nanmax(np.abs(load_raw)))
-        if raw_peak <= 0 or not np.isfinite(raw_peak):
-            return None
-        return peak_N / raw_peak
-    except Exception:
+        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
+    except FileNotFoundError:
+        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
+        return
+    ws = wb.active
+
+    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
+    id_col = header.get("Specimen ID")
+    if id_col is None:
+        print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
+        return
+
+    next_col = ws.max_column + 1
+    for label in SPECIMEN_SHEET_COLUMNS.values():
+        if label not in header:
+            ws.cell(row=1, column=next_col, value=label)
+            header[label] = next_col
+            next_col += 1
+
+    row_by_id = {ws.cell(row=r, column=id_col).value: r
+                 for r in range(2, ws.max_row + 1)}
+
+    for row in rows:
+        r = row_by_id.get(row["coupon"])
+        if r is None:
+            continue
+        for key, label in SPECIMEN_SHEET_COLUMNS.items():
+            v = row.get(key)
+            v = None if (v is None or not np.isfinite(v)) else v
+            ws.cell(row=r, column=header[label], value=v)
+
+    # openpyxl doesn't evaluate formulas, so re-saving drops the cached
+    # values of every formula cell in the workbook (e.g. Width/Dia,
+    # Computed Area) until something recalculates them. Force a full
+    # recalculation on next open so they never appear blank.
+    wb.calculation.fullCalcOnLoad = True
+    try:
+        wb.save(SPECIMEN_SHEET)
+    except PermissionError:
+        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+
+def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove pre-load slack and post-fracture frames (Level-2 failure truncation)."""
+    f = df["force_N"].to_numpy()
+    peak = float(np.nanmax(np.abs(f)))
+    if peak <= 0:
+        return df
+    i_uts = int(np.nanargmax(np.abs(f)))
+    starts = np.where(np.abs(f) > LOAD_START_FRAC * peak)[0]
+    i0 = int(starts[0]) if len(starts) else 0
+    post = np.where(np.abs(f[i_uts:]) < LOAD_END_FRAC * peak)[0]
+    i1 = int(i_uts + post[0]) if len(post) else len(f) - 1
+    return df.iloc[i0:i1 + 1].reset_index(drop=True)
+
+
+# =============================================================================
+# COMPUTE PROPERTIES
+# =============================================================================
+def compute_properties(df):
+    """
+    D638-compliant property extraction.
+
+    Returns a dict with E_GPa, eps_toe (toe-correction offset applied),
+    sigma_y_MPa, eps_y, UTS_MPa, eps_at_UTS, poisson_chord, poisson_slope,
+    plus i_uts (index of UTS in the original arrays). Also returns the
+    toe-corrected eps/sig/eps_t arrays (smoothed) and their pre-smoothing
+    counterparts (eps_raw/sig_raw) for Level-3's diagnostic overlay.
+    """
+    df = df.dropna(subset=["strain_axial", "stress_MPa"]).reset_index(drop=True)
+    if len(df) < 10:
         return None
 
+    eps_raw   = df["strain_axial"].to_numpy()
+    sig       = df["stress_MPa"].to_numpy()
+    eps_t_raw = (df["strain_transverse"].to_numpy()
+                 if "strain_transverse" in df.columns
+                 else np.full_like(eps_raw, np.nan))
+    # Pre-smoothing reference, carried through only for Level-3's diagnostic
+    # overlay — not used in any property calculation.
+    eps_unsmoothed = df["strain_axial_raw"].to_numpy() if "strain_axial_raw" in df.columns else None
+    sig_unsmoothed = df["stress_MPa_raw"].to_numpy()   if "stress_MPa_raw"   in df.columns else None
 
-def get_area_mm2(spec, cid):
-    """ASTM D638 §11.2: stress uses *original* cross-sectional area."""
-    if cid not in spec.index:
+    # ---- 1. Modulus (D638 §11.4) --------------------------------------------
+    lo, hi = MODULUS_STRAIN_RANGE
+    mfit = (eps_raw >= lo) & (eps_raw <= hi) & np.isfinite(eps_raw) & np.isfinite(sig)
+    if mfit.sum() < 3:
         return None
-    row = spec.loc[cid]
-    if isinstance(row, pd.DataFrame):
-        row = row.iloc[0]
-    return float(row["t_in"]) * float(row["w_in"]) * IN2MM * IN2MM
+    slope, intercept = np.polyfit(eps_raw[mfit], sig[mfit], 1)
+    E_MPa = float(slope)
 
-# =============================================================================
-# POINT EXTENSOMETER  — mirrors VIC-3D InspectorItemSet.add_extensometer()
-# Two fixed endpoints; nearest DIC point to each (mirrors at_global_xy);
-# =============================================================================
-def ext_endpoints(frame_csv0, axial_mm, trans_mm):
-    """
-    Compute the four endpoint world-coordinate positions from the AOI centroid
-    of the reference frame.  Returns (Xc, Y_bot, Y_top, X_lft, X_rgt, Yc).
-    """
-    ref  = pd.read_csv(frame_csv0).dropna(subset=["X", "Y"])
-    Yc   = float(ref["Y"].median())
-    Xc   = float(ref["X"].median())
-    Ymin, Ymax = float(ref["Y"].min()), float(ref["Y"].max())
-    Xmin, Xmax = float(ref["X"].min()), float(ref["X"].max())
-    Y_top = min(Yc + axial_mm / 2, Ymax)
-    Y_bot = max(Yc - axial_mm / 2, Ymin)
-    X_rgt = min(Xc + trans_mm / 2, Xmax)
-    X_lft = max(Xc - trans_mm / 2, Xmin)
-    return Xc, Y_bot, Y_top, X_lft, X_rgt, Yc
-
-
-def point_extensometer(frame_csvs, x0, y0, x1, y1):
-    """
-    VIC-3D style extensometer: two fixed endpoint markers at (x0,y0) and (x1,y1).
-    For every frame find the nearest DIC point to each endpoint (mirrors
-    VICDataSet.at_global_xy), read its (U, V) displacement, and compute
-    engineering strain from the change in distance between the displaced markers.
-
-        ε = (L_deformed − L₀) / L₀
-        L₀ = √((x1−x0)² + (y1−y0)²)
-    """
-    L0 = float(np.sqrt((x1 - x0)**2 + (y1 - y0)**2))
-    if L0 == 0:
-        return np.full(len(frame_csvs), np.nan)
-
-    eps = []
-    for fp in frame_csvs:
-        try:
-            df = pd.read_csv(fp).dropna(subset=["X", "Y", "U", "V"])
-        except Exception:
-            eps.append(np.nan); continue
-        if len(df) < 2:
-            eps.append(np.nan); continue
-
-        # Nearest DIC point to each endpoint (at_global_xy equivalent)
-        r0 = df.loc[((df["X"] - x0)**2 + (df["Y"] - y0)**2).idxmin()]
-        r1 = df.loc[((df["X"] - x1)**2 + (df["Y"] - y1)**2).idxmin()]
-
-        dx = (x1 + float(r1["U"])) - (x0 + float(r0["U"]))
-        dy = (y1 + float(r1["V"])) - (y0 + float(r0["V"]))
-        eps.append((np.sqrt(dx**2 + dy**2) - L0) / L0)
-
-    return np.array(eps)
-
-
-# =============================================================================
-# RAW MTS PLOT (sanity check; displacement zeroed to start of test)
-# =============================================================================
-def plot_mts(cid, mts):
-    fig_dir = FIGS_ROOT / cid
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    disp_rel = mts["disp_mm"].to_numpy() - float(mts["disp_mm"].iloc[0])  # relative
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(disp_rel, mts["force_N"]/1000.0, lw=1.0)
-    ax.set_xlabel("Crosshead Displacement (mm, relative)")
-    ax.set_ylabel("Force (kN)")
-    ax.set_title(f"{cid}  —  raw MTS")
-    ax.grid(alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    out = fig_dir / "MTS_force_disp.png"
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-    return out
-
-
-# =============================================================================
-# CORE
-# =============================================================================
-def process_coupon(cid, spec):
-    print(f"[{cid}]")
-    cdir = coupon_dir(cid)
-    if not cdir.is_dir():
-        print(f"  [skip] {cdir} not found"); return
-
-    DIC_DIR.mkdir(parents=True, exist_ok=True)
-    out_fp = DIC_DIR / f"{cid}_L2.csv"
-    if out_fp.exists() and not OVERWRITE:
-        print(f"  [skip] _L2.csv exists"); return
-
-    sync_fp   = find_sync_csv(cdir, cid)
-    frame_fps = find_frame_csvs(cdir, cid)
-    mts_fp    = find_mts_txt(cid)
-    area_mm2  = get_area_mm2(spec, cid)
-
-    if sync_fp is None:    print(f"  [skip] no sync CSV {cid}.csv");           return
-    if not frame_fps:      print(f"  [skip] no Level-1 per-frame CSVs");       return
-    if mts_fp is None:     print(f"  [skip] no MTS .txt — needed for mts_peak_N"); return
-    if area_mm2 is None:   print(f"  [warn] no area for {cid} — stress NaN")
-
-    print(f"  {len(frame_fps)} frames | area = "
-          + (f"{area_mm2:.2f} mm²" if area_mm2 else "N/A"))
-
-    # ---- raw MTS load ----
-    mts = load_mts_txt(mts_fp)
-    plot_mts(cid, mts)
-    peak_force_N = float(mts["force_N"].abs().max())
-    print(f"  MTS peak force: {peak_force_N/1000:.2f} kN")
-
-    # ---- sync CSV: read raw load signal (unscaled) ----
-    # Scaling is deferred to Level-3: smooth(load_raw) → scale → force_N.
-    sync = pd.read_csv(sync_fp)
-    load_col = pick_col(sync, "load")
-    disp_col = pick_col(sync, "drift")
-    time_col = pick_col(sync, "time")
-    if load_col is None:
-        print(f"  [skip] no LOAD column. Cols: {list(sync.columns)}"); return
-
-    load_raw = pd.to_numeric(sync[load_col], errors="coerce").to_numpy()
-    raw_peak = float(np.nanmax(np.abs(load_raw)))
-    if raw_peak <= 0 or not np.isfinite(raw_peak):
-        print(f"  [skip] sync load peak invalid"); return
-    print(f"  sync raw peak: {raw_peak:.4f} units  |  MTS peak: {peak_force_N:.0f} N  "
-          f"(implied scale {peak_force_N/raw_peak:.4f})")
-
-    # ---- displacement: from sync CSV "Drift" column, zeroed to start ----
-    if disp_col:
-        disp_raw = pd.to_numeric(sync[disp_col], errors="coerce").to_numpy()
-        disp_mm = disp_raw * IN2MM
-        disp_mm = disp_mm - disp_mm[0]
+    # ---- 2. Toe compensation (D638 Annex A1) --------------------------------
+    # The fitted line σ = E·ε + b is extended back to σ = 0; that strain
+    # (b/(-E)) is the "toe offset" — all strains are then measured from the
+    # corrected origin. ε_corrected = ε_raw − ε_offset.
+    eps_offset = -intercept / E_MPa if E_MPa != 0 else 0.0
+    eps   = eps_raw   - eps_offset
+    eps_unsmoothed_corr = (eps_unsmoothed - eps_offset) if eps_unsmoothed is not None else None
+    # Transverse strain: subtract its value at the corrected zero of axial strain.
+    # Find the index where corrected axial ≈ 0 and subtract that ε_t.
+    if np.any(np.isfinite(eps_t_raw)):
+        i0 = int(np.nanargmin(np.abs(eps)))
+        eps_t = eps_t_raw - eps_t_raw[i0]
     else:
-        disp_mm = np.full_like(load_raw, np.nan)
+        eps_t = eps_t_raw.copy()
 
-    time_s = (pd.to_numeric(sync[time_col], errors="coerce").to_numpy()
-              if time_col else np.arange(len(load_raw), dtype=float))
+    # ---- 3. UTS (D638 §11.2 — max stress) -----------------------------------
+    i_uts   = int(np.nanargmax(sig))
+    uts     = float(sig[i_uts])
+    eps_ult = float(eps[i_uts])
 
-    # ---- align to DIC frame count ----
-    n = min(len(load_raw), len(frame_fps))
-    load_raw, disp_mm, time_s = load_raw[:n], disp_mm[:n], time_s[:n]
-    frame_fps_used = frame_fps[:n]
+    # ---- 4. 0.2% offset yield (D638 §A2.6, Fig. A2.1) -----------------------
+    # First crossing of σ-ε curve with the line σ = E·(ε − YIELD_OFFSET).
+    sigma_y, eps_y = np.nan, np.nan
+    diff  = sig - E_MPa * (eps - YIELD_OFFSET)
+    valid = np.where(eps > YIELD_OFFSET)[0]
+    if len(valid) > 1:
+        d = diff[valid]
+        crossings = np.where(np.diff(np.sign(d)) < 0)[0]
+        if len(crossings):
+            k = valid[crossings[0]]
+            denom = diff[k] - diff[k+1]
+            f = diff[k] / denom if denom != 0 else 0.0
+            eps_y   = float(eps[k] + f * (eps[k+1] - eps[k]))
+            sigma_y = float(sig[k] + f * (sig[k+1] - sig[k]))
 
-    # ---- point extensometers: E0 axial, E1 transverse (D638 §5.2 / Annex A3) ----
-    axial_mm = AXIAL_GAUGE_IN * IN2MM
-    trans_mm = TRANS_GAUGE_IN * IN2MM
-    Xc, Y_bot, Y_top, X_lft, X_rgt, Yc = ext_endpoints(
-        frame_fps_used[0], axial_mm, trans_mm)
-    print(f"    E0 axial     (Xc={Xc:.1f})  Y: {Y_bot:.1f} → {Y_top:.1f}  "
-          f"L={Y_top-Y_bot:.1f} mm")
-    print(f"    E1 transverse (Yc={Yc:.1f})  X: {X_lft:.1f} → {X_rgt:.1f}  "
-          f"L={X_rgt-X_lft:.1f} mm")
-    eps_a = point_extensometer(frame_fps_used, Xc, Y_bot, Xc, Y_top)
-    eps_t = point_extensometer(frame_fps_used, X_lft, Yc, X_rgt, Yc)
+    # ---- 5. Poisson's ratio (D638 §A3.10.1.3, chord at ε_a = 0.002) --------
+    #   ν = − ε_t(at ε_a = 0.002) / 0.002
+    # Range 0.0005 – 0.0025 strain. Also report least-squares slope (§A3.10.1.1)
+    # for transparency when proportionality holds.
+    nu_chord = nu_slope = np.nan
+    pm = ((eps >= POISSON_RANGE[0]) & (eps <= POISSON_RANGE[1]) &
+          np.isfinite(eps) & np.isfinite(eps_t))
+    if pm.sum() >= 3:
+        nu_slope = float(-np.polyfit(eps[pm], eps_t[pm], 1)[0])
+        order = np.argsort(eps[pm])
+        ea, et = eps[pm][order], eps_t[pm][order]
+        if ea[0] <= POISSON_CHORD_AT <= ea[-1]:
+            nu_chord = float(-np.interp(POISSON_CHORD_AT, ea, et) / POISSON_CHORD_AT)
 
-    # ---- write ----
-    # force_N and stress_MPa are NOT saved — Level-3 computes them after
-    # smoothing and per-coupon scaling. load_raw, mts_peak_N, area_mm2 provide
-    # everything Level-3 needs without re-running this slow script.
-    # strain stays "raw" — toe compensation per D638 Annex A1 done in Level 3.
-    pd.DataFrame({
-        "step":              np.arange(n),
-        "time_s":            time_s,
-        "load_raw":          load_raw,
-        "disp_mm":           disp_mm,
-        "strain_axial":      eps_a,
-        "strain_transverse": eps_t,
-        "mts_peak_N":        peak_force_N,
-        "area_mm2":          area_mm2 if area_mm2 else np.nan,
-    }).to_csv(out_fp, index=False, float_format="%.6g")
-    print(f"  → DIC/{out_fp.name} ({n} rows)")
+    return {
+        "E_GPa":         E_MPa / 1000.0,
+        "eps_toe":       eps_offset,
+        "sigma_y_MPa":   sigma_y,
+        "eps_y":         eps_y,
+        "UTS_MPa":       uts,
+        "eps_at_UTS":    eps_ult,
+        "poisson_chord": nu_chord,
+        "poisson_slope": nu_slope,
+        "_eps":          eps,        # toe-corrected strain, used in property calcs
+        "_sig":          sig,
+        "_eps_t":        eps_t,
+        "_i_uts":        i_uts,
+        "_eps_raw":      eps_unsmoothed_corr,  # diagnostic overlay only
+        "_sig_raw":      sig_unsmoothed,
+    }
 
 
 # =============================================================================
@@ -355,33 +321,87 @@ def process_coupon(cid, spec):
 def main():
     t0 = time.time()
     print("=" * 70)
-    print("DIC_Level2 — pair MTS + DIC, virtual extensometers  (no truncation)")
+    print("DIC_Level2 — scale, truncate, smooth, compute D638 properties")
     print("=" * 70)
-    spec = load_specimen_sheet()
-    coupons = selected_coupons()
+    rows = []
 
-    # ---- scale factor calibration pass (informational — scaling done in Level-3) ----
-    sf_map = {cid: compute_scale_factor(cid) for cid in coupons}
-    valid  = np.array([v for v in sf_map.values() if v is not None])
-    if len(valid):
-        mean_sf = float(np.mean(valid))
-        std_sf  = float(np.std(valid, ddof=1) if len(valid) > 1 else 0.0)
-        print(f"Scale factors across {len(valid)} coupon(s) [set in Level-3]:")
-        print(f"  mean = {mean_sf:.4f} N/unit,  std = {std_sf:.4f}  "
-              f"({100*std_sf/mean_sf:.2f}% CV)")
-        for cid in coupons:
-            v = sf_map[cid]
-            print(f"    {cid}: {v:.4f}" if v is not None else f"    {cid}: N/A")
-        print(f"\n  → Set SCALE_N_PER_UNIT = {mean_sf:.4f} in Level-3\n")
+    for cid in selected_coupons():
+        l1 = find_l1(cid)
+        if l1 is None:
+            print(f"[{cid}] no _L1.csv — run Level 1 first")
+            continue
+        df = pd.read_csv(l1)
 
-    print(f"Processing {len(coupons)} coupon(s)\n")
-    for cid in coupons:
-        try:
-            process_coupon(cid, spec)
-        except Exception as ex:
-            print(f"[{cid}] [error] {ex}")
-        print()
-    print(f"Done. {time.time()-t0:.1f} s")
+        # ---- scale load_raw -> force_N -> stress_MPa --------------------
+        raw_peak = float(np.nanmax(np.abs(df["load_raw"].to_numpy())))
+        if "mts_peak_N" in df.columns and raw_peak > 0:
+            mts_peak = float(df["mts_peak_N"].iloc[0])
+            scale = mts_peak / raw_peak
+            print(f"[{cid}] per-coupon scale: {scale:.4f} N/unit  (MTS {mts_peak:.0f} N)")
+        else:
+            scale = SCALE_N_PER_UNIT
+            print(f"[{cid}] combined scale: {scale:.4f} N/unit")
+        area = float(df["area_mm2"].iloc[0]) if "area_mm2" in df.columns else np.nan
+        df["force_N"]    = df["load_raw"].to_numpy() * scale
+        df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
+
+        df = truncate_df(df)
+
+        # Keep pre-smoothing copies (still truncated) for Level-3's
+        # diagnostic overlay.
+        df["stress_MPa_raw"]   = df["stress_MPa"]
+        df["strain_axial_raw"] = df["strain_axial"]
+
+        df["force_N"]      = smooth_signal(df["force_N"].to_numpy())
+        df["stress_MPa"]   = df["force_N"] / area if np.isfinite(area) else np.nan
+        df["strain_axial"] = smooth_signal(df["strain_axial"].to_numpy())
+        if "strain_transverse" in df.columns:
+            df["strain_transverse"] = smooth_signal(df["strain_transverse"].to_numpy())
+
+        p = compute_properties(df)
+        if not p:
+            print(f"[{cid}]  insufficient data")
+            continue
+
+        print(f"[{cid}]  E={p['E_GPa']:.2f} GPa  "
+              f"σ_y={p['sigma_y_MPa']:.1f} MPa  "
+              f"UTS={p['UTS_MPa']:.1f} MPa  "
+              f"ε_UTS={p['eps_at_UTS']*100:.2f}%  "
+              f"ν_chord={p['poisson_chord']:.3f}  "
+              f"toe={p['eps_toe']*100:.3f}%")
+
+        # ---- write per-frame curve CSV for Level-3 plotting --------------
+        n_frames = len(p["_eps"])
+        eps_raw_col = p["_eps_raw"] if p["_eps_raw"] is not None else np.full(n_frames, np.nan)
+        sig_raw_col = p["_sig_raw"] if p["_sig_raw"] is not None else np.full(n_frames, np.nan)
+        pd.DataFrame({
+            "step":    np.arange(n_frames),
+            "eps":     p["_eps"],
+            "sig":     p["_sig"],
+            "eps_t":   p["_eps_t"],
+            "i_uts":   p["_i_uts"],
+            "eps_raw": eps_raw_col,
+            "sig_raw": sig_raw_col,
+        }).to_csv(DIC_DIR / f"{cid}_L2.csv", index=False, float_format="%.6g")
+
+        rows.append({"coupon": cid, **{k: v for k, v in p.items() if not k.startswith("_")}})
+
+    if rows:
+        write_specimen_sheet(rows)
+
+        # ---- D638 §11.7 / §12.1: mean & std per (exposure, direction) -------
+        df_sum = pd.DataFrame(rows)
+        df_sum["exposure"]  = df_sum["coupon"].map(lambda c: parse_id(c)[0])
+        df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
+        agg_cols = ["E_GPa", "sigma_y_MPa", "UTS_MPa", "eps_at_UTS", "poisson_chord"]
+        group = (df_sum.groupby(["exposure", "direction"])[agg_cols]
+                       .agg(["mean", "std", "count"]))
+        group.to_csv(DIC_DIR / "level2_group_stats.csv")
+
+        print(f"\n{len(rows)} coupon(s) → DIC/*_L2.csv, {SPECIMEN_SHEET.name}, "
+              f"DIC/level2_group_stats.csv")
+
+    print(f"\nDone. {time.time()-t0:.1f} s")
 
 
 if __name__ == "__main__":
