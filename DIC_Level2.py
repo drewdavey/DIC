@@ -65,6 +65,8 @@ EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
+APPLY_SMOOTHING = True  # toggle rolling-median smoothing pass (see MEDIAN_WINDOW below)
+
 # =============================================================================
 # FAILURE TRUNCATION  — applied to Level-1 data before property extraction
 # Trim pre-load slack and post-fracture rebound so only the valid test window
@@ -141,8 +143,10 @@ def find_l1(cid):
 
 def smooth_signal(x):
     """Rolling median. mode='nearest' avoids the zero-padding edge artifacts
-    scipy.signal.medfilt has."""
+    scipy.signal.medfilt has. No-op when APPLY_SMOOTHING is False."""
     x = np.asarray(x, dtype=float)
+    if not APPLY_SMOOTHING:
+        return x.copy()
     win = MEDIAN_WINDOW
     if win % 2 == 0:
         win -= 1
