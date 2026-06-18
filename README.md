@@ -90,14 +90,18 @@ no plotting here (see Level 3).
   if `mts_peak_N` is missing, and divides by `area_mm2` to get `stress_MPa`.
 - Truncates each record: drops pre-load slack (load < 2% of peak) and
   post-fracture rebound (first post-UTS frame where load < 50% of peak).
-- Smooths `force_N`/`stress_MPa`, `strain_axial`, and `strain_transverse`
-  with a rolling median (`MEDIAN_WINDOW` = 11 frames), applied only to this
-  truncated window. A median was chosen over a linear filter (e.g.
-  Butterworth) because it doesn't ring or systematically undershoot a sharp
-  peak the way averaging-based filters do — though some undershoot at UTS
-  is still possible if the window straddles into the retained post-fracture
-  decline; raise/lower `MEDIAN_WINDOW` if the plotted curve looks over- or
-  under-smoothed.
+- Smooths `force_N`/`stress_MPa`, `strain_axial`, and `strain_transverse`,
+  applied only to this truncated window. `FILTER_METHOD` selects the
+  algorithm:
+  - `"median"` (default) — rolling median (`MEDIAN_WINDOW` = 31 frames).
+    Preferred default — doesn't ring or systematically undershoot a sharp
+    peak the way an averaging-based filter does — though some undershoot at
+    UTS is still possible if the window straddles into the retained
+    post-fracture decline; raise/lower `MEDIAN_WINDOW` if the plotted curve
+    looks over- or under-smoothed.
+  - `"butterworth"` — zero-phase low-pass filter (`BUTTER_ORDER`,
+    `BUTTER_CUTOFF`), clipped to the raw data's range to suppress filtfilt
+    ringing at the truncation edges.
 - Computes, from this truncated, smoothed signal:
   - **Modulus E** (D638 §11.4) — slope of the linear region (0.05–0.3% strain).
   - **Toe compensation** (D638 Annex A1) — shifts strain origin using the

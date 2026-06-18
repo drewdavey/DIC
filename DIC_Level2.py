@@ -3,8 +3,9 @@
 DIC_Level2.py  —  FSR Tensile Coupons
 ======================================
 Reads Level-1 per-coupon CSVs, scales raw load to force/stress, applies
-failure truncation and a light rolling-median smoothing pass, and computes
-ASTM D638 mechanical properties. No plotting here — see DIC_Level3.py.
+failure truncation and a light smoothing pass (median or Butterworth, see
+FILTER_METHOD), and computes ASTM D638 mechanical properties. No plotting
+here — see DIC_Level3.py.
 
 Standards compliance — what each calculation cites
   Toe compensation     : D638 Annex A1 (mandatory unless toe is real material response)
@@ -40,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.ndimage import median_filter
+from scipy.signal import butter, filtfilt
 import openpyxl
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -65,7 +67,8 @@ EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
-APPLY_SMOOTHING = True  # toggle rolling-median smoothing pass (see MEDIAN_WINDOW below)
+APPLY_SMOOTHING = True   # toggle the smoothing pass below on/off
+FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
 
 # =============================================================================
 # FAILURE TRUNCATION  — applied to Level-1 data before property extraction
@@ -115,10 +118,20 @@ SPECIMEN_SHEET_COLUMNS = {
 }
 
 # =============================================================================
-# SMOOTHING  (rolling median)
-# Window must be odd. Raise MEDIAN_WINDOW for noisier data.
+# SMOOTHING  — FILTER_METHOD selects which of these is used
+#   "median"     : rolling median. Window must be odd. Raise MEDIAN_WINDOW
+#                  for noisier data. Preferred default — doesn't ring or
+#                  systematically undershoot a sharp peak the way an
+#                  averaging-based filter like Butterworth can.
+#   "butterworth": zero-phase low-pass (filtfilt). Lower BUTTER_CUTOFF for
+#                  heavier smoothing; raise BUTTER_ORDER for a sharper
+#                  rolloff. Output is clipped to the raw data's range to
+#                  suppress filtfilt ringing at the truncation edges.
 # =============================================================================
-MEDIAN_WINDOW = 11  # frames
+MEDIAN_WINDOW = 31  # frames
+
+BUTTER_ORDER  = 2     # filter order
+BUTTER_CUTOFF = 0.1  # cutoff frequency, fraction of Nyquist (0-1)
 
 # =============================================================================
 # HELPERS
@@ -142,17 +155,44 @@ def find_l1(cid):
     return p if p.exists() else None
 
 def smooth_signal(x):
-    """Rolling median. mode='nearest' avoids the zero-padding edge artifacts
-    scipy.signal.medfilt has. No-op when APPLY_SMOOTHING is False."""
+    """Dispatches to the filter selected by FILTER_METHOD. No-op when
+    APPLY_SMOOTHING is False."""
     x = np.asarray(x, dtype=float)
     if not APPLY_SMOOTHING:
         return x.copy()
+    if FILTER_METHOD == "butterworth":
+        return _smooth_butterworth(x)
+    return _smooth_median(x)
+
+def _smooth_median(x):
+    """Rolling median. mode='nearest' avoids the zero-padding edge artifacts
+    scipy.signal.medfilt has."""
     win = MEDIAN_WINDOW
     if win % 2 == 0:
         win -= 1
     if win < 1 or len(x) < win:
         return x.copy()
     return median_filter(x, size=win, mode="constant", cval=np.nan)
+
+def _smooth_butterworth(x):
+    """Zero-phase low-pass (filtfilt). NaN gaps are bridged by linear
+    interpolation before filtering, then the original NaN positions are
+    restored. Output is clipped to the raw data's range — filtfilt can ring
+    past it, especially near the truncation edges."""
+    n = len(x)
+    padlen = 3 * BUTTER_ORDER
+    nan_mask = ~np.isfinite(x)
+    if nan_mask.all() or n <= padlen:
+        return x.copy()
+    xi = x.copy()
+    if nan_mask.any():
+        idx = np.arange(n)
+        xi[nan_mask] = np.interp(idx[nan_mask], idx[~nan_mask], x[~nan_mask])
+    b, a = butter(BUTTER_ORDER, BUTTER_CUTOFF, btype="low", analog=False)
+    out = filtfilt(b, a, xi)
+    out = np.clip(out, np.nanmin(xi), np.nanmax(xi))
+    out[nan_mask] = np.nan
+    return out
 
 def write_specimen_sheet(rows: list[dict]) -> None:
     """Write each coupon's scalar properties into its row in SPECIMEN_SHEET,
