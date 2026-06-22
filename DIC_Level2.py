@@ -130,8 +130,8 @@ SPECIMEN_SHEET_COLUMNS = {
 # =============================================================================
 MEDIAN_WINDOW = 31  # frames
 
-BUTTER_ORDER  = 2     # filter order
-BUTTER_CUTOFF = 0.1  # cutoff frequency, fraction of Nyquist (0-1)
+BUTTER_ORDER  = 3     # filter order
+BUTTER_CUTOFF = 10  # cutoff frequency, fraction of Nyquist (0-1)
 
 # =============================================================================
 # HELPERS
@@ -389,7 +389,7 @@ def main():
         df["force_N"]    = df["load_raw"].to_numpy() * scale
         df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
 
-        df = truncate_df(df)
+        df = truncate_df(df) # NEED TO TRUNCAGTE BACK TO N-1
 
         # Keep pre-smoothing copies (still truncated) for Level-3's
         # diagnostic overlay.
