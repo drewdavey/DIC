@@ -253,7 +253,9 @@ def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
     starts = np.where(np.abs(f) > LOAD_START_FRAC * peak)[0]
     i0 = int(starts[0]) if len(starts) else 0
     post = np.where(np.abs(f[i_uts:]) < LOAD_END_FRAC * peak)[0]
-    i1 = int(i_uts + post[0]) if len(post) else len(f) - 1
+    # stop one frame BEFORE the first post-UTS drop-off so the failure point
+    # itself isn't kept (it corrupts the smoothing pass)
+    i1 = int(i_uts + post[0]) - 1 if len(post) else len(f) - 1
     return df.iloc[i0:i1 + 1].reset_index(drop=True)
 
 
@@ -389,7 +391,7 @@ def main():
         df["force_N"]    = df["load_raw"].to_numpy() * scale
         df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
 
-        df = truncate_df(df) # NEED TO TRUNCAGTE BACK TO N-1
+        df = truncate_df(df)
 
         # Keep pre-smoothing copies (still truncated) for Level-3's
         # diagnostic overlay.
