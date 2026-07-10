@@ -67,8 +67,9 @@ EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
-APPLY_SMOOTHING = True   # toggle the smoothing pass below on/off
-FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
+APPLY_SMOOTHING = False  # ASTM D638 does not call for filtering the stress-strain record;
+                          # toggle on only if a batch's raw signal is genuinely too noisy.
+FILTER_METHOD   = "median"  # "median" or "butterworth" — see SMOOTHING section below
 
 # =============================================================================
 # FAILURE TRUNCATION  — applied to Level-1 data before property extraction
@@ -131,7 +132,7 @@ SPECIMEN_SHEET_COLUMNS = {
 MEDIAN_WINDOW = 31  # frames
 
 BUTTER_ORDER  = 3     # filter order
-BUTTER_CUTOFF = 10  # cutoff frequency, fraction of Nyquist (0-1)
+BUTTER_CUTOFF = 0.1   # cutoff frequency, fraction of Nyquist (0-1) — must be < 1
 
 # =============================================================================
 # HELPERS
