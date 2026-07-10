@@ -71,7 +71,7 @@ REPLICATES = ["01", "02", "03"]
 
 APPLY_SMOOTHING = False  # ASTM D638 does not call for filtering the stress-strain record;
                           # toggle on only if a batch's raw signal is genuinely too noisy.
-FILTER_METHOD   = "median"  # "median" or "butterworth" — see SMOOTHING section below
+FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
 
 # =============================================================================
 # CONSTANTS / COLUMNS — DIC-sync raw file
@@ -112,7 +112,7 @@ SPECIMEN_SHEET_COLUMNS = {
 MEDIAN_WINDOW = 31
 
 BUTTER_ORDER  = 3
-BUTTER_CUTOFF = 0.1   # fraction of Nyquist (0-1) — must be < 1, unlike DIC_Level2.py's current value
+BUTTER_CUTOFF = 0.1   # fraction of Nyquist (0-1) — must be < 1
 
 # =============================================================================
 # HELPERS

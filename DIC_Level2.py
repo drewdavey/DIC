@@ -3,9 +3,17 @@
 DIC_Level2.py  —  FSR Tensile Coupons
 ======================================
 Reads Level-1 per-coupon CSVs, scales raw load to force/stress, applies
-failure truncation and a light smoothing pass (median or Butterworth, see
-FILTER_METHOD), and computes ASTM D638 mechanical properties. No plotting
-here — see DIC_Level3.py.
+failure truncation, and computes ASTM D638 mechanical properties. An
+optional smoothing pass (median or Butterworth, see APPLY_SMOOTHING /
+FILTER_METHOD) is available but off by default — ASTM D638 doesn't call
+for filtering the stress-strain record; only enable it if a batch's raw
+signal is genuinely too noisy. No plotting here — see DIC_Level3.py.
+
+See also DIC_Level2_tmp.py: a one-off variant of this script that derives
+force/stress from peak-force-anchored raw MTS data instead of scaling the
+DIC sync CSV's own load channel, used for batches where that channel is
+unreliable. It writes the same outputs as this script but leaves this
+file untouched.
 
 Standards compliance — what each calculation cites
   Toe compensation     : D638 Annex A1 (mandatory unless toe is real material response)
@@ -19,18 +27,21 @@ PROCESSING NOTE
   Level-1 writes the full, untruncated record (see its docstring). All
   failure truncation happens here via truncate_df(): pre-load slack and
   post-fracture rebound (past 50% post-UTS load drop) are cut. Properties
-  are computed from this truncated, smoothed window; pre-smoothing values
-  (still truncated) are kept alongside for Level-3's diagnostic overlay.
+  are computed from this truncated window (smoothed, if APPLY_SMOOTHING is
+  on); pre-smoothing values (still truncated) are kept alongside either
+  way for Level-3's diagnostic overlay — they're identical to the smoothed
+  columns when smoothing is off.
 
 OUTPUT per coupon
   <DIC_DIR>/<coupon_id>_L2.csv   step, eps, sig, eps_t, i_uts, eps_raw, sig_raw
-                                 (eps/sig/eps_t are toe-corrected + smoothed;
-                                  eps_raw/sig_raw are the same window pre-smoothing)
+                                 (eps/sig/eps_t are toe-corrected, and smoothed
+                                  if APPLY_SMOOTHING is on; eps_raw/sig_raw are
+                                  the same truncated window pre-smoothing)
   FSR-SpecimenTesting.xlsx       scalar properties written into each coupon's
                                  row (E, toe strain, yield stress/strain, UTS,
                                  strain at UTS, Poisson's ratio) — the single
-                                 source of truth for per-coupon scalars used
-                                 by Level-3 and the group-plot scripts.
+                                 source of truth for per-coupon scalars, read
+                                 back out by Level-3.
   <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
@@ -69,7 +80,7 @@ REPLICATES = ["01", "02", "03"]
 
 APPLY_SMOOTHING = False  # ASTM D638 does not call for filtering the stress-strain record;
                           # toggle on only if a batch's raw signal is genuinely too noisy.
-FILTER_METHOD   = "median"  # "median" or "butterworth" — see SMOOTHING section below
+FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
 
 # =============================================================================
 # FAILURE TRUNCATION  — applied to Level-1 data before property extraction
@@ -106,7 +117,8 @@ POISSON_CHORD_AT = 0.002
 
 # Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
 # ("Specimen ID") — maps the property dict key to the Excel column header.
-# Level-3 and the group-plot scripts read these same headers back out.
+# Level-3 reads these same headers back out (per-coupon plots, group plots,
+# and the printed/exported stat tables all read from this one workbook).
 SPECIMEN_SHEET_COLUMNS = {
     "E_GPa":         "E (GPa)",
     "eps_toe":       "Toe Strain",
@@ -270,8 +282,9 @@ def compute_properties(df):
     Returns a dict with E_GPa, eps_toe (toe-correction offset applied),
     sigma_y_MPa, eps_y, UTS_MPa, eps_at_UTS, poisson_chord, poisson_slope,
     plus i_uts (index of UTS in the original arrays). Also returns the
-    toe-corrected eps/sig/eps_t arrays (smoothed) and their pre-smoothing
-    counterparts (eps_raw/sig_raw) for Level-3's diagnostic overlay.
+    toe-corrected eps/sig/eps_t arrays (smoothed, if APPLY_SMOOTHING is on)
+    and their pre-smoothing counterparts (eps_raw/sig_raw) for Level-3's
+    diagnostic overlay.
     """
     df = df.dropna(subset=["strain_axial", "stress_MPa"]).reset_index(drop=True)
     if len(df) < 10:

@@ -10,30 +10,45 @@ Exposures: `CL` (Control), `SW` (Seawater), `UV`, `IS` (In-Situ).
 
 **Pipeline split**: Level 1 extracts the raw DIC fields *and* pairs them
 with the MTS load frame into a per-coupon stress/strain-ready record
-(nothing truncated, nothing scaled yet). Level 2 owns all of the tunable
-signal processing — scaling, failure truncation, smoothing — and computes
-the D638 mechanical properties. Level 3 only plots; it reads everything it
-needs from Level 2's outputs and never recomputes anything. The scalar
-mechanical properties (E, yield, UTS, Poisson's ratio, ...) are written
-**once**, into `FSR-SpecimenTesting.xlsx`, and that workbook is the single
-source of truth every downstream script (Level 3, `tensile_group_plots.py`,
-`printStatsAll.py`, `matlab/tensile_plots.m`) reads from — there is no
+(nothing truncated, nothing scaled yet), plus a raw-signal sanity check.
+Level 2 owns all of the tunable signal processing — scaling, failure
+truncation, optional smoothing — and computes the D638 mechanical
+properties. Level 3 only plots and summarizes; it reads everything it
+needs from Level 2's outputs (plus raw MTS files for bearing, which has
+no DIC step of its own) and never recomputes any tensile property. The
+scalar mechanical properties (E, yield, UTS, Poisson's ratio, ...) are
+written **once**, into `FSR-SpecimenTesting.xlsx`, and that workbook is
+the single source of truth every downstream part of Level 3 (per-coupon
+plots, group plots, and the printed stat tables) reads from — there is no
 separate per-coupon summary CSV to keep in sync.
+
+**Merge history**: `tensile_group_plots.py`, `printStatsAll.py`, and
+`force_displacement_signal_plots.py` used to be separate scripts. Their
+functionality now lives inside `DIC_Level3.py` (group plots + stat tables)
+and `DIC_Level1.py` (Step C, raw-signal plots), respectively — those
+standalone files have been removed. `matlab/tensile_plots.m` and
+`matlab/bearing_plots.m` are an independent MATLAB re-implementation of
+part of Level 3's plotting, kept for reference; they are not run as part
+of this pipeline and aren't guaranteed to stay in sync with it.
 
 ---
 
 ## Level 1 — `DIC_Level1.py`
 
 **Step A** — converts raw VIC-3D `.out` files into per-frame CSVs, written
-next to each `.out` file on the raw data drive (unchanged location —
-that's where VIC-3D's project files already live, and where the per-frame
-CSVs belong).
+next to each `.out` file in its coupon's raw-data folder.
 
 **Step B** — pairs those per-frame CSVs with the MTS force/displacement
 record, computes virtual axial + transverse extensometers, and writes one
 full (untruncated) result CSV per coupon. No failure truncation or load
 scaling happens here — that's Level 2's job, so it can be tuned without
 re-running the slow per-`.out` export or the extensometer pass.
+
+**Step C** — signal-inspection plots and a cross-check report comparing
+the raw MTS file and the raw DIC-sync CSV's force/displacement channels
+directly against each other. Independent of Steps A/B: it's a sanity
+check on the *inputs*, not on anything Level 1 computes, and always
+reruns when enabled (cheap — no vicpyx calls).
 
 **What it does**
 - Step A: walks each selected coupon's data directory, finds every `.out`
@@ -48,6 +63,13 @@ re-running the slow per-`.out` export or the extensometer pass.
   transverse 1.0 in / 25.4 mm, per ASTM D638 §5.2.1 / Annex A3.5.2) and
   computes engineering strain from marker displacement each frame; saves a
   raw MTS force-displacement sanity-check plot.
+- Step C: for each coupon, plots the raw MTS force/displacement vs. time,
+  and a twin-axis plot of the DIC sync CSV's raw (volts) vs. scaled
+  (engineering-unit) force and displacement channels side by side; then
+  writes one aggregate report row per coupon cross-checking the DIC-sync
+  and MTS peak forces, the raw→scaled linear calibration for each DIC
+  channel, and the dominant FFT frequency of each raw channel (useful for
+  spotting sensor noise/aliasing).
 
 **Switches** (independent, so the slow step never reruns just to rebuild
 the fast one):
@@ -57,12 +79,20 @@ the fast one):
   skip coupons whose `_L1.csv` already exists. Flip to `True` to rebuild
   just the consolidated CSV (e.g. after changing a gauge-length constant)
   without re-exporting any `.out` files.
+- `DO_SIGNAL_PLOTS` — Step C. `ZERO_DISPLACEMENT` (default `True`) shifts
+  the displacement traces in Step C's plots so the first finite value is
+  zero; doesn't affect `_L1.csv` (its `disp_mm` is zeroed separately in
+  Step B).
 
 **Inputs**
 - `<coupon_dir>/*.out` — VIC-3D full-field export, one per DIC frame.
 - `<coupon_dir>/<coupon_id>.csv` — VIC sync CSV (analog channels @ DIC frame rate).
 - `<MTS_DIR>/<coupon_id>*.txt` — MTS raw file: `disp_mm, force_N, output_V, time_s`.
 - `FSR-SpecimenTesting.xlsx` — gauge thickness × width → cross-sectional area.
+- `<coupon_dir>` lives under `DATA_ROOTS[exposure]`, which points at
+  `DIC_DIR/raw/<project-folder>` — a local mirror of the raw VIC-3D project
+  data. (Older notes may reference `G:\DrewDavey\...`; that external-drive
+  location is stale — the raw data now lives under `DIC_DIR/raw` instead.)
 
 **Outputs**
 - `<coupon_dir>/<out_filename>.csv` — one CSV per `.out` file, written next
@@ -72,16 +102,22 @@ the fast one):
   load_raw, disp_mm, strain_axial, strain_transverse, mts_peak_N, area_mm2`.
   (`DIC_DIR` is the `DIC/` folder next to `MTS/`, not inside the coupon's
   raw data folder.)
-- `<FIGS_ROOT>/<coupon_id>/MTS_force_disp.png` — raw MTS curve sanity check.
+- `<FIGS_ROOT>/<coupon_id>/MTS_force_disp.png` — raw MTS force-vs-displacement
+  curve, Step B's sanity check.
+- `<FIGS_ROOT>/<coupon_id>/MTS_force_displacement_signals.png` — Step C:
+  raw MTS force and displacement vs. time.
+- `<FIGS_ROOT>/<coupon_id>/DIC_sync_force_displacement_signals.png` — Step C:
+  raw vs. scaled DIC-sync force/displacement channels vs. time.
+- `<DIC_DIR>/raw_dic_force_displacement_signal_report.csv` — Step C's
+  per-coupon cross-check table (one row per coupon).
 
 ---
 
 ## Level 2 — `DIC_Level2.py`
 
 Reads Level-1's per-coupon CSVs, scales raw load to force/stress, applies
-failure truncation and a light rolling-median smoothing pass, computes
-ASTM D638 mechanical properties, and writes everything downstream needs —
-no plotting here (see Level 3).
+failure truncation, and computes ASTM D638 mechanical properties. No
+plotting here (see Level 3).
 
 **What it does**
 - Scales `load_raw` to `force_N` using the per-coupon scale factor
@@ -90,19 +126,25 @@ no plotting here (see Level 3).
   if `mts_peak_N` is missing, and divides by `area_mm2` to get `stress_MPa`.
 - Truncates each record: drops pre-load slack (load < 2% of peak) and
   post-fracture rebound (first post-UTS frame where load < 50% of peak).
-- Smooths `force_N`/`stress_MPa`, `strain_axial`, and `strain_transverse`,
-  applied only to this truncated window. `FILTER_METHOD` selects the
-  algorithm:
-  - `"median"` (default) — rolling median (`MEDIAN_WINDOW` = 31 frames).
-    Preferred default — doesn't ring or systematically undershoot a sharp
-    peak the way an averaging-based filter does — though some undershoot at
-    UTS is still possible if the window straddles into the retained
-    post-fracture decline; raise/lower `MEDIAN_WINDOW` if the plotted curve
-    looks over- or under-smoothed.
+- **Smoothing is optional and off by default** (`APPLY_SMOOTHING = False`)
+  — ASTM D638 doesn't call for filtering the stress-strain record, and the
+  modulus/UTS/yield windows sit well clear of where the raw signal is
+  noisiest. If a batch's raw signal genuinely needs it, flip
+  `APPLY_SMOOTHING` on; `FILTER_METHOD` selects the algorithm:
+  - `"median"` (recommended when enabled) — rolling median
+    (`MEDIAN_WINDOW` = 31 frames). Doesn't ring or systematically
+    undershoot a sharp peak the way an averaging-based filter does — though
+    some undershoot at UTS is still possible if the window straddles into
+    the retained post-fracture decline; raise/lower `MEDIAN_WINDOW` if the
+    plotted curve looks over- or under-smoothed.
   - `"butterworth"` — zero-phase low-pass filter (`BUTTER_ORDER`,
-    `BUTTER_CUTOFF`), clipped to the raw data's range to suppress filtfilt
-    ringing at the truncation edges.
-- Computes, from this truncated, smoothed signal:
+    `BUTTER_CUTOFF`, fraction of Nyquist — must stay `< 1`), clipped to the
+    raw data's range to suppress `filtfilt` ringing at the truncation
+    edges. Because clipping only chops the amplitude of any overshoot
+    rather than removing it, it can still leave a flat "shelf" artifact
+    right at a sharp peak — median is the safer default if you turn
+    smoothing on.
+- Computes, from this truncated (and, if enabled, smoothed) signal:
   - **Modulus E** (D638 §11.4) — slope of the linear region (0.05–0.3% strain).
   - **Toe compensation** (D638 Annex A1) — shifts strain origin using the
     modulus line's x-intercept.
@@ -121,9 +163,10 @@ no plotting here (see Level 3).
 **Outputs**
 - `<DIC_DIR>/<coupon_id>_L2.csv` — per-frame curve data only: `step, eps,
   sig, eps_t, i_uts, eps_raw, sig_raw`. `eps`/`sig`/`eps_t` are
-  toe-corrected and smoothed; `eps_raw`/`sig_raw` are the same truncated
-  window *before* smoothing, kept only so Level-3 can draw its raw-vs-
-  smoothed diagnostic overlay without recomputing anything. Scalar
+  toe-corrected (and smoothed, if `APPLY_SMOOTHING` is on); `eps_raw`/
+  `sig_raw` are the same truncated window *before* smoothing (identical to
+  `eps`/`sig` when smoothing is off), kept only so Level-3 can draw its
+  raw-vs-smoothed diagnostic overlay without recomputing anything. Scalar
   properties are *not* repeated here — they live once per coupon in
   `FSR-SpecimenTesting.xlsx` (see below).
 - `FSR-SpecimenTesting.xlsx` (`SPECIMEN_SHEET`) — each coupon's scalar
@@ -133,45 +176,110 @@ no plotting here (see Level 3).
   rows, formulas, and formatting in the workbook are left alone. If the
   file is open elsewhere when Level 2 runs, this step is skipped with a
   warning rather than failing the whole run. **This is the only place
-  scalar properties are stored** — Level 3 and the group-plot scripts read
-  them back out of here rather than recomputing.
+  scalar properties are stored** — Level 3 reads them back out of here
+  rather than recomputing.
 - `<DIC_DIR>/level2_group_stats.csv` — D638 §11.7 mean/std/count per
   (exposure, direction) group.
+
+### Variant — `DIC_Level2_tmp.py`
+
+A one-off alternate Level-2 run, used when the DIC sync CSV's own "Load"
+channel for a batch is only trustworthy as a *shape* and its peak-only
+rescale (Level 2's normal method) isn't good enough. Instead of scaling
+`load_raw`, it maps the *entire* raw MTS force/displacement time series
+onto each DIC frame: the DIC-sync peak-force row and the raw-MTS
+peak-force row are treated as the same physical instant (the two files
+don't share a clock), and each DIC frame's time offset from that anchor
+is used to interpolate MTS force/displacement at the matching MTS-clock
+time. Truncation, optional smoothing, and property calculations are
+otherwise identical to `DIC_Level2.py`, and it writes to the exact same
+files (`_L2.csv`, `FSR-SpecimenTesting.xlsx`, `level2_group_stats.csv`) —
+running it after `DIC_Level2.py` overwrites Level 2's results with this
+method's. `DIC_Level2.py` itself is never modified by running this; it
+remains the standard pipeline for future batches. Needs the same raw DIC
+sync CSVs as Level 1 (`DATA_ROOTS`, pointing at `DIC_DIR/raw/...`) plus
+`MTS_DIR`, in addition to Level-2's usual `_L1.csv` input.
 
 ---
 
 ## Level 3 — `DIC_Level3.py`
 
-Plot-only. Reads Level-2's per-frame curve CSVs and the scalar properties
-Level-2 already wrote into `FSR-SpecimenTesting.xlsx`, and saves per-coupon
-plots. **Writes no CSVs.**
+Plot- and stats-only. Reads Level-2's per-frame curve CSVs and the scalar
+properties Level-2 already wrote into `FSR-SpecimenTesting.xlsx`, and
+produces per-coupon plots, group overlay/summary plots, and mean ± std
+(CV%) property tables — for both tensile (D638) and pin-bearing (D953)
+coupons. **Writes no CSVs**; the only files it writes besides plots are
+`P01_MechanicalStats.xlsx` (the stat tables). Nothing tensile is
+recomputed — bearing statistics are the one exception, computed here
+directly from the raw MTS `.txt` files since bearing has no DIC/Level-2
+step of its own.
+
+**Switches**
+- `DO_PER_COUPON_PLOTS` — per-coupon σ-ε and Poisson plots.
+- `DO_GROUP_PLOTS` — the raw-MTS force-displacement group plot and all
+  three DIC-derived group plots (curve overlay, property scatter,
+  peak-strength).
+- `DO_PRINT_STATS` — the D638 tensile + D953 bearing mean±std(CV%) tables
+  (stdout) and the `P01_MechanicalStats.xlsx` export.
+- `DIC_EXCLUDE` — coupon IDs to drop from the group plots and stat tables
+  only (per-coupon plots still include them). Currently `P01-TCL45-01`,
+  excluded for an anomalously large toe correction (see the `TODO` next to
+  it) pending backup DIC data.
+
+**What it does**
+- Per-coupon: draws each coupon's toe-corrected σ-ε curve (truncated at
+  UTS) with modulus/0.2%-offset/yield/UTS markers and an Airtech
+  reference line, plus the pre-smoothing raw curve for comparison; and a
+  −ε_xx vs ε_yy Poisson plot. Both read straight from `_L2.csv` — no
+  spline fit, resampling, or other alteration of Level-2's data.
+- Group (MTS): reads every `P01-T*.txt` directly and plots raw
+  force-vs-displacement curves for all coupons, colored by exposure,
+  styled by direction, with peak-force markers.
+- Group (DIC): reads every coupon's `_L2.csv` (truncated at UTS, again
+  unaltered) for the σ-ε overlay; reads `UTS_MPa`/`E_GPa` from the
+  specimen sheet for the property-scatter and peak-strength plots.
+- Print stats: builds tensile property rows from the specimen sheet
+  (E, yield stress, UTS, strain at UTS, Poisson's chord ratio) plus
+  peak load read directly from the raw MTS tensile files; builds bearing
+  rows by toe-correcting each raw MTS bearing curve (D953 Appendix X1
+  tangent method) and computing pin-bearing strength at 4% hole
+  deformation (D953-19 §13.3) and at failure (§3.2.5). Both tables are
+  aggregated by (exposure, direction) and by direction alone (all
+  exposures pooled), printed to stdout, and exported to Excel.
 
 **Inputs**
 - `<DIC_DIR>/<coupon_id>_L2.csv` — Level-2 per-frame curves.
 - `FSR-SpecimenTesting.xlsx` — Level-2's scalar properties, read back by
   column header (e.g. `"E (GPa)"`, `"UTS (MPa)"`) and matched on Specimen ID.
+- `<MTS_DIR>/P01-T*.txt` — raw MTS tensile files (group force-displacement
+  plot + peak-load stat column).
+- `<MTS_DIR>/P01-B*.txt` — raw MTS pin-bearing files (bearing stats only;
+  no DIC/Level-2 counterpart).
 
 **Outputs**
 - `<FIGS_ROOT>/<coupon_id>/stress_strain_DIC.png` — per-coupon σ-ε curve
   (toe-corrected, truncated at UTS) with modulus/yield/UTS markers, plus
   the pre-smoothing raw curve in light gray for comparison.
 - `<FIGS_ROOT>/<coupon_id>/poisson_DIC.png` — per-coupon −ε_xx vs ε_yy plot.
-
-Group overlay plots (`tensile_curves_DIC.png`, `tensile_summary_DIC.png`)
-are produced separately by `tensile_group_plots.py`, which (like
-`matlab/tensile_plots.m`) also reads scalar properties from
-`FSR-SpecimenTesting.xlsx` rather than from any per-coupon CSV.
+- `<FIGS_ROOT>/tensile_mts_FD.png` — group raw-MTS force vs. displacement.
+- `<FIGS_ROOT>/tensile_curves_DIC.png` — group σ-ε overlay.
+- `<FIGS_ROOT>/tensile_summary_DIC.png` — group UTS/E property scatter.
+- `<FIGS_ROOT>/tensile_peak_strength_DIC.png` — group UTS by exposure.
+- stdout — tensile (D638) + bearing (D953) mean±std(CV%) tables.
+- `P01_MechanicalStats.xlsx` — same stats, `Tensile` + `Bearing` sheets.
 
 ---
 
 ## Common configuration
 
-All three scripts share a `SWITCHES` block at the top (`PRINTS`,
-`EXPOSURES`, `DIRECTIONS`, `REPLICATES`) used to select which coupons to
-process, and a `PATHS` block — trimmed to only what each level actually
-touches (e.g. Level 2 and Level 3 don't need the raw-data `DATA_ROOTS` or
-`MTS_DIR` at all, since by the time they run everything they need is
-already in `DIC_DIR` or the specimen sheet).
+All scripts share a `SWITCHES` block at the top (`PRINTS`, `EXPOSURES`,
+`DIRECTIONS`, `REPLICATES`) used to select which coupons to process, and
+a `PATHS` block — trimmed to only what each script actually touches.
+`DIC_Level2.py` and `DIC_Level3.py` don't need the raw-data `DATA_ROOTS`
+at all, since by the time they run everything they need is already in
+`DIC_DIR` or the specimen sheet; `DIC_Level2_tmp.py` is the exception —
+it needs both the raw DIC sync CSVs (`DATA_ROOTS`) and `MTS_DIR`, same as
+Level 1, because it re-derives force from the raw MTS record.
 
 ## File naming history
 
