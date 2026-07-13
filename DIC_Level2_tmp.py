@@ -18,9 +18,17 @@ This script writes the same production outputs as DIC_Level2.py so
 DIC_Level3.py can consume them unchanged. DIC_Level2.py itself is left
 untouched — it remains the standard pipeline for future batches.
 
-OUTPUT per coupon (identical contract to DIC_Level2.py)
-  <DIC_DIR>/<coupon_id>_L2.csv   step, eps, sig, eps_t, i_uts, eps_raw, sig_raw
-  FSR-SpecimenTesting.xlsx       scalar properties written into each coupon's row
+OUTPUT per coupon (identical contract to DIC_Level2.py, plus one extra
+column of its own)
+  <DIC_DIR>/<coupon_id>.csv   Level-1's columns, unchanged, plus:
+                               kept, force_N, stress_MPa, strain_axial,
+                               strain_transverse, stress_MPa_unsmoothed,
+                               strain_axial_unsmoothed, disp_mm_mts (the
+                               peak-anchored MTS displacement this script
+                               derives — kept separate from Level-1's own
+                               disp_mm, which stays untouched as the raw
+                               sync-CSV reference).
+  FSR-SpecimenTesting.xlsx   scalar properties written into each coupon's row
   <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
@@ -82,7 +90,8 @@ IN2MM   = 25.4
 DIC_FORCE_SCALED_COL = "LOAD_[kip]_|_CH07_/ai2_scaled"
 
 # =============================================================================
-# FAILURE TRUNCATION  — applied before property extraction
+# FAILURE TRUNCATION  — restricts Level-1 data to the valid test window
+# before property extraction (mirrors DIC_Level2.py).
 # =============================================================================
 LOAD_START_FRAC = 0.02
 LOAD_END_FRAC   = 0.50
@@ -134,9 +143,17 @@ def coupon_dir(cid):
     exposure, _ = parse_id(cid)
     return DATA_ROOTS[exposure] / cid
 
-def find_l1(cid):
-    p = DIC_DIR / f"{cid}_L1.csv"
+def find_frames_csv(cid):
+    p = DIC_DIR / f"{cid}.csv"
     return p if p.exists() else None
+
+def load_coupon_scalars() -> pd.DataFrame:
+    """coupon_scalars.csv, indexed by coupon — only area_mm2 is needed here
+    (mts_peak_N isn't: force comes straight from the mapped MTS record)."""
+    fp = DIC_DIR / "coupon_scalars.csv"
+    if not fp.exists():
+        return pd.DataFrame(columns=["mts_peak_N", "area_mm2"])
+    return pd.read_csv(fp).set_index("coupon")
 
 def find_mts_txt(cid):
     exact = [MTS_DIR / f"{cid}.txt", MTS_DIR / f"{cid}-TEST.txt"]
@@ -265,17 +282,21 @@ def write_specimen_sheet(rows: list[dict]) -> None:
     except PermissionError:
         print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
 
-def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
-    f = df["force_N"].to_numpy()
-    peak = float(np.nanmax(np.abs(f)))
+def truncation_mask(force_N: np.ndarray) -> np.ndarray:
+    """Boolean mask, same length as force_N, selecting the valid test
+    window: pre-load slack and post-fracture rebound are False."""
+    n = len(force_N)
+    peak = float(np.nanmax(np.abs(force_N)))
     if peak <= 0:
-        return df
-    i_uts = int(np.nanargmax(np.abs(f)))
-    starts = np.where(np.abs(f) > LOAD_START_FRAC * peak)[0]
+        return np.ones(n, dtype=bool)
+    i_uts = int(np.nanargmax(np.abs(force_N)))
+    starts = np.where(np.abs(force_N) > LOAD_START_FRAC * peak)[0]
     i0 = int(starts[0]) if len(starts) else 0
-    post = np.where(np.abs(f[i_uts:]) < LOAD_END_FRAC * peak)[0]
-    i1 = int(i_uts + post[0]) - 1 if len(post) else len(f) - 1
-    return df.iloc[i0:i1 + 1].reset_index(drop=True)
+    post = np.where(np.abs(force_N[i_uts:]) < LOAD_END_FRAC * peak)[0]
+    i1 = int(i_uts + post[0]) - 1 if len(post) else n - 1
+    mask = np.zeros(n, dtype=bool)
+    mask[i0:i1 + 1] = True
+    return mask
 
 
 # =============================================================================
@@ -288,7 +309,8 @@ def map_mts_force_disp(cid, n_l1):
     DIC-sync peak-force row and the raw-MTS peak-force row are treated as
     the same physical instant. Each DIC frame's time offset from that
     anchor is used to interpolate MTS force/displacement at the
-    corresponding MTS-clock time. Returns (n, force_N, disp_mm) or None.
+    corresponding MTS-clock time. Returns (force_N, disp_mm), each length
+    n_l1 (NaN-padded past the sync CSV's length if it's shorter), or None.
     """
     sync_fp = find_dic_sync_csv(cid)
     mts_fp = find_mts_txt(cid)
@@ -329,24 +351,33 @@ def map_mts_force_disp(cid, n_l1):
           f"peak_i sync/MTS={sync_peak_i}/{mts_peak_i}  "
           f"MTS_peak={abs(mts_force_N[mts_peak_i]):.1f} N")
 
-    return n, mapped_force_N, mapped_disp_mm
+    if n < n_l1:
+        pad = np.full(n_l1 - n, np.nan)
+        mapped_force_N = np.concatenate([mapped_force_N, pad])
+        mapped_disp_mm = np.concatenate([mapped_disp_mm, pad])
+    return mapped_force_N, mapped_disp_mm
 
 
 # =============================================================================
 # COMPUTE PROPERTIES  (mirrors DIC_Level2.py)
 # =============================================================================
-def compute_properties(df):
-    df = df.dropna(subset=["strain_axial", "stress_MPa"]).reset_index(drop=True)
-    if len(df) < 10:
+def compute_properties(eps_axial, sig, eps_transverse,
+                       eps_axial_unsmoothed=None, sig_unsmoothed=None):
+    eps_axial = np.asarray(eps_axial, dtype=float)
+    sig = np.asarray(sig, dtype=float)
+    eps_transverse = np.asarray(eps_transverse, dtype=float)
+
+    valid = np.isfinite(eps_axial) & np.isfinite(sig)
+    if valid.sum() < 10:
         return None
 
-    eps_raw   = df["strain_axial"].to_numpy()
-    sig       = df["stress_MPa"].to_numpy()
-    eps_t_raw = (df["strain_transverse"].to_numpy()
-                 if "strain_transverse" in df.columns
-                 else np.full_like(eps_raw, np.nan))
-    eps_unsmoothed = df["strain_axial_raw"].to_numpy() if "strain_axial_raw" in df.columns else None
-    sig_unsmoothed = df["stress_MPa_raw"].to_numpy()   if "stress_MPa_raw"   in df.columns else None
+    eps_raw   = eps_axial[valid]
+    sig       = sig[valid]
+    eps_t_raw = eps_transverse[valid]
+    eps_unsmoothed = (np.asarray(eps_axial_unsmoothed, dtype=float)[valid]
+                       if eps_axial_unsmoothed is not None else None)
+    sig_unsmoothed = (np.asarray(sig_unsmoothed, dtype=float)[valid]
+                       if sig_unsmoothed is not None else None)
 
     lo, hi = MODULUS_STRAIN_RANGE
     mfit = (eps_raw >= lo) & (eps_raw <= hi) & np.isfinite(eps_raw) & np.isfinite(sig)
@@ -370,12 +401,12 @@ def compute_properties(df):
 
     sigma_y, eps_y = np.nan, np.nan
     diff  = sig - E_MPa * (eps - YIELD_OFFSET)
-    valid = np.where(eps > YIELD_OFFSET)[0]
-    if len(valid) > 1:
-        d = diff[valid]
+    valid_y = np.where(eps > YIELD_OFFSET)[0]
+    if len(valid_y) > 1:
+        d = diff[valid_y]
         crossings = np.where(np.diff(np.sign(d)) < 0)[0]
         if len(crossings):
-            k = valid[crossings[0]]
+            k = valid_y[crossings[0]]
             denom = diff[k] - diff[k+1]
             f = diff[k] / denom if denom != 0 else 0.0
             eps_y   = float(eps[k] + f * (eps[k+1] - eps[k]))
@@ -403,9 +434,9 @@ def compute_properties(df):
         "_eps":          eps,
         "_sig":          sig,
         "_eps_t":        eps_t,
-        "_i_uts":        i_uts,
         "_eps_raw":      eps_unsmoothed_corr,
         "_sig_raw":      sig_unsmoothed,
+        "_valid":        valid,
     }
 
 
@@ -418,37 +449,41 @@ def main():
     print("DIC_Level2_tmp — batch Level-2 run using peak-anchored MTS force mapping")
     print("=" * 70)
     rows = []
+    scalars = load_coupon_scalars()
 
     for cid in selected_coupons():
-        l1_fp = find_l1(cid)
-        if l1_fp is None:
-            print(f"[{cid}] no _L1.csv — run Level 1 first")
+        frames_fp = find_frames_csv(cid)
+        if frames_fp is None:
+            print(f"[{cid}] no per-coupon CSV — run Level 1 first")
             continue
-        df = pd.read_csv(l1_fp)
+        df = pd.read_csv(frames_fp)
+        n = len(df)
 
-        mapped = map_mts_force_disp(cid, len(df))
+        mapped = map_mts_force_disp(cid, n)
         if mapped is None:
             continue
-        n, mapped_force_N, mapped_disp_mm = mapped
-        df = df.iloc[:n].reset_index(drop=True)
+        force_N_all, disp_mm_mts = mapped
 
-        area = float(df["area_mm2"].iloc[0]) if "area_mm2" in df.columns else np.nan
-        df["force_N"]    = mapped_force_N
-        df["disp_mm"]    = mapped_disp_mm
-        df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
+        area = (float(scalars.loc[cid, "area_mm2"])
+                if cid in scalars.index and pd.notna(scalars.loc[cid, "area_mm2"])
+                else np.nan)
 
-        df = truncate_df(df)
+        # ---- failure truncation ---------------------------------------------
+        kept = truncation_mask(force_N_all)
+        kept_idx = np.flatnonzero(kept)
 
-        df["stress_MPa_raw"]   = df["stress_MPa"]
-        df["strain_axial_raw"] = df["strain_axial"]
+        force_kept  = force_N_all[kept]
+        stress_kept = force_kept / area if np.isfinite(area) else np.full(kept.sum(), np.nan)
+        eps_a_kept  = df["strain_axial_raw"].to_numpy()[kept]
+        eps_t_kept  = df["strain_transverse_raw"].to_numpy()[kept]
 
-        df["force_N"]      = smooth_signal(df["force_N"].to_numpy())
-        df["stress_MPa"]   = df["force_N"] / area if np.isfinite(area) else np.nan
-        df["strain_axial"] = smooth_signal(df["strain_axial"].to_numpy())
-        if "strain_transverse" in df.columns:
-            df["strain_transverse"] = smooth_signal(df["strain_transverse"].to_numpy())
+        force_smoothed  = smooth_signal(force_kept)
+        stress_smoothed = force_smoothed / area if np.isfinite(area) else np.full(kept.sum(), np.nan)
+        eps_a_smoothed  = smooth_signal(eps_a_kept)
+        eps_t_smoothed  = smooth_signal(eps_t_kept)
 
-        p = compute_properties(df)
+        p = compute_properties(eps_a_smoothed, stress_smoothed, eps_t_smoothed,
+                               eps_axial_unsmoothed=eps_a_kept, sig_unsmoothed=stress_kept)
         if not p:
             print(f"[{cid}]  insufficient data")
             continue
@@ -460,18 +495,23 @@ def main():
               f"ν_chord={p['poisson_chord']:.3f}  "
               f"toe={p['eps_toe']*100:.3f}%")
 
-        n_frames = len(p["_eps"])
-        eps_raw_col = p["_eps_raw"] if p["_eps_raw"] is not None else np.full(n_frames, np.nan)
-        sig_raw_col = p["_sig_raw"] if p["_sig_raw"] is not None else np.full(n_frames, np.nan)
-        pd.DataFrame({
-            "step":    np.arange(n_frames),
-            "eps":     p["_eps"],
-            "sig":     p["_sig"],
-            "eps_t":   p["_eps_t"],
-            "i_uts":   p["_i_uts"],
-            "eps_raw": eps_raw_col,
-            "sig_raw": sig_raw_col,
-        }).to_csv(DIC_DIR / f"{cid}_L2.csv", index=False, float_format="%.6g")
+        # ---- scatter L2 columns back onto the full per-frame file -----------
+        final_idx = kept_idx[p["_valid"]]
+
+        def scatter(values):
+            col = np.full(n, np.nan)
+            col[final_idx] = values
+            return col
+
+        df["kept"]                     = kept
+        df["force_N"]                  = scatter(force_smoothed[p["_valid"]])
+        df["stress_MPa"]               = scatter(p["_sig"])
+        df["strain_axial"]             = scatter(p["_eps"])
+        df["strain_transverse"]        = scatter(p["_eps_t"])
+        df["stress_MPa_unsmoothed"]    = scatter(p["_sig_raw"])
+        df["strain_axial_unsmoothed"]  = scatter(p["_eps_raw"])
+        df["disp_mm_mts"]              = disp_mm_mts
+        df.to_csv(frames_fp, index=False, float_format="%.6g")
 
         rows.append({"coupon": cid, **{k: v for k, v in p.items() if not k.startswith("_")}})
 
@@ -486,7 +526,7 @@ def main():
                        .agg(["mean", "std", "count"]))
         group.to_csv(DIC_DIR / "level2_group_stats.csv")
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*_L2.csv, {SPECIMEN_SHEET.name}, "
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
               f"DIC/level2_group_stats.csv")
 
     print(f"\nDone. {time.time()-t0:.1f} s")

@@ -32,9 +32,14 @@ INPUT per coupon
 OUTPUTS
 -------
 - <coupon_dir>/<out_filename>.csv        one CSV per .out file, written next to it
-- <DIC_DIR>/<coupon_id>_L1.csv           step, time_s, load_raw, disp_mm,
-                                         strain_axial, strain_transverse,
-                                         mts_peak_N, area_mm2
+- <DIC_DIR>/<coupon_id>.csv              full per-frame record: step, time_s,
+                                         disp_mm, load_raw, strain_axial_raw,
+                                         strain_transverse_raw.
+                                         Level-2 reads this same file and appends
+                                         its own columns in place — see its docstring.
+- <DIC_DIR>/coupon_scalars.csv           one row per coupon: coupon, mts_peak_N,
+                                         area_mm2 — the only place these two scalars
+                                         are stored (not repeated in the per-frame CSV).
 - <FIGS_ROOT>/<coupon_id>/MTS_force_disp.png   raw MTS curve (sanity check)
 - <FIGS_ROOT>/<coupon_id>/MTS_force_displacement_signals.png       raw MTS force/disp vs. time
 - <FIGS_ROOT>/<coupon_id>/DIC_sync_force_displacement_signals.png  raw vs. scaled DIC-sync channels
@@ -70,7 +75,7 @@ MTS_DIR = Path(
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\MTS"
 )
-DIC_DIR = MTS_DIR.parent / "DIC"   # consolidated _L1.csv files land here
+DIC_DIR = MTS_DIR.parent / "DIC"   # per-coupon frame CSVs + coupon_scalars.csv land here
 # Raw VIC-3D project data (.out/.tif per frame + per-coupon sync CSV), mirrored
 # locally under DIC_DIR/raw — G:\DrewDavey\... was the old external-drive location.
 DATA_ROOTS = {
@@ -104,11 +109,12 @@ REPLICATES = ["01", "02", "03"]
 DO_EXPORT_FRAMES = True     # Step A: export each .out to a CSV next to it
 OVERWRITE_FRAMES = False    # if False, skip .out files whose .csv already exists
 DO_BUILD_L1      = True     # Step B: pair frames + MTS, build extensometers
-OVERWRITE_L1     = False    # if False, skip coupons whose _L1.csv already exists
+OVERWRITE_L1     = False    # if False, skip coupons whose per-coupon CSV already exists
 DO_SIGNAL_PLOTS  = True     # Step C: raw MTS + DIC-sync signal-inspection plots + report CSV
 
 # If True, displacement signals in the Step C plots are shifted so the first
-# finite value is zero. Doesn't affect _L1.csv (disp_mm there is zeroed separately).
+# finite value is zero. Doesn't affect the per-coupon CSV (disp_mm there is
+# zeroed separately).
 ZERO_DISPLACEMENT = True
 
 # Variables to export from each .out (Step A)
@@ -360,24 +366,25 @@ def plot_mts(cid, mts):
 
 
 # =============================================================================
-# STEP B — pair frames + MTS, build extensometers, write _L1.csv
+# STEP B — pair frames + MTS, build extensometers, write per-coupon CSV
 # =============================================================================
-def build_l1(cid, cdir, spec) -> bool:
-    """Step B for one coupon. Returns True if _L1.csv was written."""
+def build_l1(cid, cdir, spec) -> dict | None:
+    """Step B for one coupon. Returns the coupon's scalar row (for
+    coupon_scalars.csv) if the per-coupon CSV was written, else None."""
     DIC_DIR.mkdir(parents=True, exist_ok=True)
-    out_fp = DIC_DIR / f"{cid}_L1.csv"
+    out_fp = DIC_DIR / f"{cid}.csv"
     if out_fp.exists() and not OVERWRITE_L1:
-        print(f"  Step B: [skip] _L1.csv exists")
-        return False
+        print(f"  Step B: [skip] {out_fp.name} exists")
+        return None
 
     sync_fp   = find_sync_csv(cdir, cid)
     frame_fps = find_frame_csvs(cdir, cid)
     mts_fp    = find_mts_txt(cid)
     area_mm2  = get_area_mm2(spec, cid)
 
-    if sync_fp is None:    print(f"  Step B: [skip] no sync CSV {cid}.csv");           return False
-    if not frame_fps:      print(f"  Step B: [skip] no per-frame CSVs (run Step A first)"); return False
-    if mts_fp is None:     print(f"  Step B: [skip] no MTS .txt — needed for mts_peak_N"); return False
+    if sync_fp is None:    print(f"  Step B: [skip] no sync CSV {cid}.csv");           return None
+    if not frame_fps:      print(f"  Step B: [skip] no per-frame CSVs (run Step A first)"); return None
+    if mts_fp is None:     print(f"  Step B: [skip] no MTS .txt — needed for mts_peak_N"); return None
     if area_mm2 is None:   print(f"  Step B: [warn] no area for {cid} — stress NaN")
 
     print(f"  Step B: {len(frame_fps)} frames | area = "
@@ -396,12 +403,12 @@ def build_l1(cid, cdir, spec) -> bool:
     disp_col = pick_col(sync, "drift")
     time_col = pick_col(sync, "time")
     if load_col is None:
-        print(f"  Step B: [skip] no LOAD column. Cols: {list(sync.columns)}"); return False
+        print(f"  Step B: [skip] no LOAD column. Cols: {list(sync.columns)}"); return None
 
     load_raw = pd.to_numeric(sync[load_col], errors="coerce").to_numpy()
     raw_peak = float(np.nanmax(np.abs(load_raw)))
     if raw_peak <= 0 or not np.isfinite(raw_peak):
-        print(f"  Step B: [skip] sync load peak invalid"); return False
+        print(f"  Step B: [skip] sync load peak invalid"); return None
     print(f"  sync raw peak: {raw_peak:.4f} units  |  MTS peak: {peak_force_N:.0f} N  "
           f"(implied scale {peak_force_N/raw_peak:.4f})")
 
@@ -435,21 +442,22 @@ def build_l1(cid, cdir, spec) -> bool:
 
     # ---- write ----
     # force_N and stress_MPa are NOT saved — Level-2 computes them after
-    # smoothing and per-coupon scaling. load_raw, mts_peak_N, area_mm2 provide
-    # everything Level-2 needs without re-running this slower step.
+    # smoothing and per-coupon scaling, then appends them (plus 'kept',
+    # toe-corrected strain, etc.) as new columns on this same file. mts_peak_N
+    # and area_mm2 are per-coupon scalars, not per-row — they go in
+    # coupon_scalars.csv instead of being repeated down every row here.
     # strain stays "raw" — toe compensation per D638 Annex A1 done in Level-2.
     pd.DataFrame({
-        "step":              np.arange(n),
-        "time_s":            time_s,
-        "load_raw":          load_raw,
-        "disp_mm":           disp_mm,
-        "strain_axial":      eps_a,
-        "strain_transverse": eps_t,
-        "mts_peak_N":        peak_force_N,
-        "area_mm2":          area_mm2 if area_mm2 else np.nan,
+        "step":                   np.arange(n),
+        "time_s":                 time_s,
+        "disp_mm":                disp_mm,
+        "load_raw":               load_raw,
+        "strain_axial_raw":       eps_a,
+        "strain_transverse_raw":  eps_t,
     }).to_csv(out_fp, index=False, float_format="%.6g")
     print(f"  → DIC/{out_fp.name} ({n} rows)")
-    return True
+    return {"coupon": cid, "mts_peak_N": peak_force_N,
+            "area_mm2": area_mm2 if area_mm2 else np.nan}
 
 
 # =============================================================================
@@ -717,26 +725,46 @@ def write_dic_report(coupons) -> Path:
     print(f"DIC report: {out_fp}")
     return out_fp
 
+def write_coupon_scalars(rows: list[dict]) -> Path:
+    """Upsert this run's per-coupon scalars (mts_peak_N, area_mm2) into
+    coupon_scalars.csv — the single place these are stored, so they're
+    never repeated down every row of a per-frame CSV. Coupons skipped this
+    run (their per-coupon CSV already existed and OVERWRITE_L1 is False)
+    keep whatever row is already on disk from a previous run."""
+    out_fp = DIC_DIR / "coupon_scalars.csv"
+    DIC_DIR.mkdir(parents=True, exist_ok=True)
+    merged = {}
+    if out_fp.exists():
+        for row in pd.read_csv(out_fp).to_dict("records"):
+            merged[row["coupon"]] = row
+    for row in rows:
+        merged[row["coupon"]] = row
+    pd.DataFrame(sorted(merged.values(), key=lambda r: r["coupon"])
+                ).to_csv(out_fp, index=False, float_format="%.6g")
+    print(f"Coupon scalars: {out_fp}")
+    return out_fp
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
-def process_coupon(cid, spec) -> dict:
+def process_coupon(cid, spec) -> tuple[dict, dict | None]:
     print(f"[{cid}]")
     cdir = coupon_dir(cid)
     if not cdir.is_dir():
         print(f"  [skip] directory not found: {cdir}")
-        return {"coupon": cid}
+        return {"coupon": cid}, None
 
     stats = {"coupon": cid}
+    scalar_row = None
     if DO_EXPORT_FRAMES:
         stats.update(export_frames(cid, cdir))
     if DO_BUILD_L1:
-        build_l1(cid, cdir, spec)
+        scalar_row = build_l1(cid, cdir, spec)
     if DO_SIGNAL_PLOTS:
         plot_mts_signals(cid)
         plot_dic_sync_signals(cid, cdir)
-    return stats
+    return stats, scalar_row
 
 
 def main():
@@ -755,12 +783,19 @@ def main():
     print(f"Processing {len(coupons)} coupon(s)\n")
 
     summary = []
+    scalar_rows = []
     for cid in coupons:
         try:
-            summary.append(process_coupon(cid, spec))
+            stats, scalar_row = process_coupon(cid, spec)
+            summary.append(stats)
+            if scalar_row is not None:
+                scalar_rows.append(scalar_row)
         except Exception as ex:
             print(f"[{cid}] [error] {ex}")
         print()
+
+    if DO_BUILD_L1:
+        write_coupon_scalars(scalar_rows)
 
     if DO_SIGNAL_PLOTS:
         write_dic_report(coupons)

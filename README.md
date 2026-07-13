@@ -22,6 +22,20 @@ the single source of truth every downstream part of Level 3 (per-coupon
 plots, group plots, and the printed stat tables) reads from — there is no
 separate per-coupon summary CSV to keep in sync.
 
+**One CSV per coupon, columns appended as it moves through the levels**:
+Level 1 writes `<DIC_DIR>/<coupon_id>.csv`, one row per DIC frame,
+untruncated. Level 2 reads that same file and appends its own columns to
+it in place — there's no separate `_L1.csv`/`_L2.csv` pair, no duplicate
+`step`/`time_s` columns, and no reindexing to track between levels.
+Failure truncation doesn't drop rows; it sets a boolean `kept` column
+(`True` inside Level-2's analysis window) and leaves every Level-2-derived
+column `NaN` outside it, so a coupon's full untruncated record and its
+truncated analysis window live side by side in the same file. Per-coupon
+scalars that used to be repeated down every row (`mts_peak_N`, `area_mm2`)
+now live once each in `<DIC_DIR>/coupon_scalars.csv`; `i_uts` (the index of
+UTS) was dropped entirely since it's just `argmax(stress_MPa)` within the
+kept rows — recomputing it is cheaper than storing and keeping it in sync.
+
 **Merge history**: `tensile_group_plots.py`, `printStatsAll.py`, and
 `force_displacement_signal_plots.py` used to be separate scripts. Their
 functionality now lives inside `DIC_Level3.py` (group plots + stat tables)
@@ -76,13 +90,13 @@ the fast one):
 - `DO_EXPORT_FRAMES` / `OVERWRITE_FRAMES` — Step A. `OVERWRITE_FRAMES`
   defaults `False`: skip `.out` files whose CSV already exists.
 - `DO_BUILD_L1` / `OVERWRITE_L1` — Step B. `OVERWRITE_L1` defaults `False`:
-  skip coupons whose `_L1.csv` already exists. Flip to `True` to rebuild
-  just the consolidated CSV (e.g. after changing a gauge-length constant)
-  without re-exporting any `.out` files.
+  skip coupons whose per-coupon CSV already exists. Flip to `True` to
+  rebuild just the consolidated CSV (e.g. after changing a gauge-length
+  constant) without re-exporting any `.out` files.
 - `DO_SIGNAL_PLOTS` — Step C. `ZERO_DISPLACEMENT` (default `True`) shifts
   the displacement traces in Step C's plots so the first finite value is
-  zero; doesn't affect `_L1.csv` (its `disp_mm` is zeroed separately in
-  Step B).
+  zero; doesn't affect the per-coupon CSV (its `disp_mm` is zeroed
+  separately in Step B).
 
 **Inputs**
 - `<coupon_dir>/*.out` — VIC-3D full-field export, one per DIC frame.
@@ -98,10 +112,15 @@ the fast one):
 - `<coupon_dir>/<out_filename>.csv` — one CSV per `.out` file, written next
   to it, with columns `X, Y, Z, U, V, W, exx, eyy, exy, e1, e2, gamma, x, y,
   u, v, q, r, q_ref, r_ref` (sigma is used only to filter rows, not exported).
-- `<DIC_DIR>/<coupon_id>_L1.csv` — full per-frame record: `step, time_s,
-  load_raw, disp_mm, strain_axial, strain_transverse, mts_peak_N, area_mm2`.
+- `<DIC_DIR>/<coupon_id>.csv` — full per-frame record: `step, time_s,
+  disp_mm, load_raw, strain_axial_raw, strain_transverse_raw`. Level 2
+  reads this same file and appends its own columns to it (see below).
   (`DIC_DIR` is the `DIC/` folder next to `MTS/`, not inside the coupon's
   raw data folder.)
+- `<DIC_DIR>/coupon_scalars.csv` — one row per coupon: `coupon, mts_peak_N,
+  area_mm2`. The only place these two scalars are stored — Level 2 reads
+  them from here instead of finding them repeated down every row of the
+  per-frame CSV.
 - `<FIGS_ROOT>/<coupon_id>/MTS_force_disp.png` — raw MTS force-vs-displacement
   curve, Step B's sanity check.
 - `<FIGS_ROOT>/<coupon_id>/MTS_force_displacement_signals.png` — Step C:
@@ -121,11 +140,13 @@ plotting here (see Level 3).
 
 **What it does**
 - Scales `load_raw` to `force_N` using the per-coupon scale factor
-  (`mts_peak_N / max(|load_raw|)`, both already in `_L1.csv` — no separate
-  calibration pass needed), falling back to a combined `SCALE_N_PER_UNIT`
-  if `mts_peak_N` is missing, and divides by `area_mm2` to get `stress_MPa`.
-- Truncates each record: drops pre-load slack (load < 2% of peak) and
-  post-fracture rebound (first post-UTS frame where load < 50% of peak).
+  (`mts_peak_N / max(|load_raw|)`, read from `coupon_scalars.csv` — no
+  separate calibration pass needed), falling back to a combined
+  `SCALE_N_PER_UNIT` if `mts_peak_N` is missing, and divides by `area_mm2`
+  (also from `coupon_scalars.csv`) to get `stress_MPa`.
+- Truncates each record: marks pre-load slack (load < 2% of peak) and
+  post-fracture rebound (first post-UTS frame where load < 50% of peak) as
+  outside the analysis window (`kept = False`) rather than dropping rows.
 - **Smoothing is optional and off by default** (`APPLY_SMOOTHING = False`)
   — ASTM D638 doesn't call for filtering the stress-strain record, and the
   modulus/UTS/yield windows sit well clear of where the raw signal is
@@ -158,17 +179,20 @@ plotting here (see Level 3).
   re-run freely while tuning truncation/smoothing/property settings.
 
 **Inputs**
-- `<DIC_DIR>/<coupon_id>_L1.csv` — Level-1 output (one per coupon).
+- `<DIC_DIR>/<coupon_id>.csv` — Level-1 output (one per coupon).
+- `<DIC_DIR>/coupon_scalars.csv` — per-coupon `mts_peak_N`, `area_mm2`.
 
 **Outputs**
-- `<DIC_DIR>/<coupon_id>_L2.csv` — per-frame curve data only: `step, eps,
-  sig, eps_t, i_uts, eps_raw, sig_raw`. `eps`/`sig`/`eps_t` are
-  toe-corrected (and smoothed, if `APPLY_SMOOTHING` is on); `eps_raw`/
-  `sig_raw` are the same truncated window *before* smoothing (identical to
-  `eps`/`sig` when smoothing is off), kept only so Level-3 can draw its
-  raw-vs-smoothed diagnostic overlay without recomputing anything. Scalar
-  properties are *not* repeated here — they live once per coupon in
-  `FSR-SpecimenTesting.xlsx` (see below).
+- `<DIC_DIR>/<coupon_id>.csv` — the same file Level 1 wrote, with new
+  columns appended: `kept` (bool, inside the truncated analysis window),
+  `force_N`, `stress_MPa`, `strain_axial`, `strain_transverse`
+  (toe-corrected, and smoothed if `APPLY_SMOOTHING` is on), and
+  `stress_MPa_unsmoothed`/`strain_axial_unsmoothed` (the same window
+  *before* smoothing — identical to the smoothed columns when smoothing is
+  off), kept only so Level-3 can draw its raw-vs-smoothed diagnostic
+  overlay without recomputing anything. All of these are `NaN` where
+  `kept` is `False`. Scalar properties are *not* repeated here — they live
+  once per coupon in `FSR-SpecimenTesting.xlsx` (see below).
 - `FSR-SpecimenTesting.xlsx` (`SPECIMEN_SHEET`) — each coupon's scalar
   properties (E, toe strain, yield stress/strain, UTS, strain at UTS,
   Poisson's ratio) are written into new columns on that coupon's existing
@@ -193,12 +217,15 @@ don't share a clock), and each DIC frame's time offset from that anchor
 is used to interpolate MTS force/displacement at the matching MTS-clock
 time. Truncation, optional smoothing, and property calculations are
 otherwise identical to `DIC_Level2.py`, and it writes to the exact same
-files (`_L2.csv`, `FSR-SpecimenTesting.xlsx`, `level2_group_stats.csv`) —
-running it after `DIC_Level2.py` overwrites Level 2's results with this
-method's. `DIC_Level2.py` itself is never modified by running this; it
-remains the standard pipeline for future batches. Needs the same raw DIC
-sync CSVs as Level 1 (`DATA_ROOTS`, pointing at `DIC_DIR/raw/...`) plus
-`MTS_DIR`, in addition to Level-2's usual `_L1.csv` input.
+files (the per-coupon CSV, `FSR-SpecimenTesting.xlsx`,
+`level2_group_stats.csv`) — running it after `DIC_Level2.py` overwrites
+Level 2's results with this method's. It also adds one column of its own,
+`disp_mm_mts` (the peak-anchored MTS displacement it derives), without
+touching Level-1's own `disp_mm` column. `DIC_Level2.py` itself is never
+modified by running this; it remains the standard pipeline for future
+batches. Needs the same raw DIC sync CSVs as Level 1 (`DATA_ROOTS`,
+pointing at `DIC_DIR/raw/...`) plus `MTS_DIR`, in addition to Level-2's
+usual per-coupon CSV input.
 
 ---
 
@@ -230,13 +257,14 @@ step of its own.
 - Per-coupon: draws each coupon's toe-corrected σ-ε curve (truncated at
   UTS) with modulus/0.2%-offset/yield/UTS markers and an Airtech
   reference line, plus the pre-smoothing raw curve for comparison; and a
-  −ε_xx vs ε_yy Poisson plot. Both read straight from `_L2.csv` — no
-  spline fit, resampling, or other alteration of Level-2's data.
+  −ε_xx vs ε_yy Poisson plot. Both read straight from the per-coupon CSV's
+  `kept == True` rows — no spline fit, resampling, or other alteration of
+  Level-2's data.
 - Group (MTS): reads every `P01-T*.txt` directly and plots raw
   force-vs-displacement curves for all coupons, colored by exposure,
   styled by direction, with peak-force markers.
-- Group (DIC): reads every coupon's `_L2.csv` (truncated at UTS, again
-  unaltered) for the σ-ε overlay; reads `UTS_MPa`/`E_GPa` from the
+- Group (DIC): reads every coupon's `kept == True` rows (truncated at UTS,
+  again unaltered) for the σ-ε overlay; reads `UTS_MPa`/`E_GPa` from the
   specimen sheet for the property-scatter and peak-strength plots.
 - Print stats: builds tensile property rows from the specimen sheet
   (E, yield stress, UTS, strain at UTS, Poisson's chord ratio) plus
@@ -248,7 +276,7 @@ step of its own.
   exposures pooled), printed to stdout, and exported to Excel.
 
 **Inputs**
-- `<DIC_DIR>/<coupon_id>_L2.csv` — Level-2 per-frame curves.
+- `<DIC_DIR>/<coupon_id>.csv` — Level-2's per-frame curves (`kept == True` rows).
 - `FSR-SpecimenTesting.xlsx` — Level-2's scalar properties, read back by
   column header (e.g. `"E (GPa)"`, `"UTS (MPa)"`) and matched on Specimen ID.
 - `<MTS_DIR>/P01-T*.txt` — raw MTS tensile files (group force-displacement
@@ -292,3 +320,12 @@ properties. That pairing step is now part of Level 1, the truncation/
 property step is now Level 2, `_L2.csv` → `_L1.csv`, `_L3.csv` → `_L2.csv`,
 and `level3_summary.csv` was retired in favor of `FSR-SpecimenTesting.xlsx`
 as the single scalar-property store.
+
+More recently, `_L1.csv`/`_L2.csv` were merged into one file per coupon:
+`<coupon_id>.csv`, written by Level 1 and appended to by Level 2 (see
+"One CSV per coupon" above). If you have old `_L1.csv`/`_L2.csv` pairs on
+disk from before this change, they're stale — re-run Level 1 then Level 2
+to regenerate `<coupon_id>.csv` and `coupon_scalars.csv` (which replaces
+the `mts_peak_N`/`area_mm2` columns that used to be repeated down every
+row of `_L1.csv`, and the `i_uts` column that used to be repeated down
+every row of `_L2.csv`).

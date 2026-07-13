@@ -2,7 +2,7 @@
 """
 DIC_Level2.py  —  FSR Tensile Coupons
 ======================================
-Reads Level-1 per-coupon CSVs, scales raw load to force/stress, applies
+Reads Level-1's per-coupon frame CSV, scales raw load to force/stress, applies
 failure truncation, and computes ASTM D638 mechanical properties. An
 optional smoothing pass (median or Butterworth, see APPLY_SMOOTHING /
 FILTER_METHOD) is available but off by default — ASTM D638 doesn't call
@@ -24,24 +24,34 @@ Standards compliance — what each calculation cites
   Group statistics      : D638 §11.7 / §12.1   (mean, std per series)
 
 PROCESSING NOTE
-  Level-1 writes the full, untruncated record (see its docstring). All
-  failure truncation happens here via truncate_df(): pre-load slack and
-  post-fracture rebound (past 50% post-UTS load drop) are cut. Properties
-  are computed from this truncated window (smoothed, if APPLY_SMOOTHING is
-  on); pre-smoothing values (still truncated) are kept alongside either
-  way for Level-3's diagnostic overlay — they're identical to the smoothed
-  columns when smoothing is off.
+  Level-1 writes the full, untruncated per-frame record (see its docstring).
+  Level-2 reads that SAME file and appends its own columns to it in place —
+  no separate per-coupon output file. Failure truncation happens here via
+  truncation_mask(): pre-load slack and post-fracture rebound (past 50%
+  post-UTS load drop) are marked out of the analysis window rather than
+  dropped from the file — every L2-derived column is NaN outside that
+  window, and the boolean 'kept' column marks which rows are inside it.
+  Properties are computed from this window (smoothed, if APPLY_SMOOTHING is
+  on); pre-smoothing values (still restricted to the window) are kept
+  alongside either way for Level-3's diagnostic overlay — they're identical
+  to the smoothed columns when smoothing is off.
+
+INPUT per coupon
+  <DIC_DIR>/<coupon_id>.csv      Level-1's per-frame record (see its docstring)
+  <DIC_DIR>/coupon_scalars.csv   per-coupon mts_peak_N, area_mm2 (Level-1 output)
 
 OUTPUT per coupon
-  <DIC_DIR>/<coupon_id>_L2.csv   step, eps, sig, eps_t, i_uts, eps_raw, sig_raw
-                                 (eps/sig/eps_t are toe-corrected, and smoothed
-                                  if APPLY_SMOOTHING is on; eps_raw/sig_raw are
-                                  the same truncated window pre-smoothing)
-  FSR-SpecimenTesting.xlsx       scalar properties written into each coupon's
-                                 row (E, toe strain, yield stress/strain, UTS,
-                                 strain at UTS, Poisson's ratio) — the single
-                                 source of truth for per-coupon scalars, read
-                                 back out by Level-3.
+  <DIC_DIR>/<coupon_id>.csv   Level-1's columns, unchanged, plus:
+                               kept, force_N, stress_MPa, strain_axial,
+                               strain_transverse (toe-corrected, and smoothed
+                               if APPLY_SMOOTHING is on), stress_MPa_unsmoothed,
+                               strain_axial_unsmoothed (same window, pre-smoothing).
+                               All L2 columns are NaN where kept is False.
+  FSR-SpecimenTesting.xlsx    scalar properties written into each coupon's
+                               row (E, toe strain, yield stress/strain, UTS,
+                               strain at UTS, Poisson's ratio) — the single
+                               source of truth for per-coupon scalars, read
+                               back out by Level-3.
   <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
@@ -83,9 +93,9 @@ APPLY_SMOOTHING = False  # ASTM D638 does not call for filtering the stress-stra
 FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
 
 # =============================================================================
-# FAILURE TRUNCATION  — applied to Level-1 data before property extraction
-# Trim pre-load slack and post-fracture rebound so only the valid test window
-# is passed to compute_properties.
+# FAILURE TRUNCATION  — restricts Level-1 data to the valid test window
+# before property extraction. Trims pre-load slack and post-fracture
+# rebound; frames outside this window get NaN in every L2-derived column.
 # =============================================================================
 LOAD_START_FRAC = 0.02     # pre-load: drop frames before load exceeds this × peak
 LOAD_END_FRAC   = 0.50     # post-fracture: cut first post-UTS frame where load < this × peak
@@ -93,7 +103,7 @@ LOAD_END_FRAC   = 0.50     # post-fracture: cut first post-UTS frame where load 
 # Scale factor applied to load_raw to produce force_N (N per sync-CSV unit).
 # Two modes — the first one found is used:
 #   1. Per-coupon  : mts_peak_N / max(raw load_raw)  — most accurate, always
-#                    available since Level-1 always writes mts_peak_N
+#                    available since Level-1 always writes a coupon_scalars.csv row
 #   2. Combined    : SCALE_N_PER_UNIT below          — fallback safety net
 SCALE_N_PER_UNIT: float = 555.5928
 
@@ -163,9 +173,17 @@ def parse_id(cid):
     part = cid.split("-")[1]
     return part[1:-2], part[-2:]
 
-def find_l1(cid):
-    p = DIC_DIR / f"{cid}_L1.csv"
+def find_frames_csv(cid):
+    p = DIC_DIR / f"{cid}.csv"
     return p if p.exists() else None
+
+def load_coupon_scalars() -> pd.DataFrame:
+    """coupon_scalars.csv, indexed by coupon — mts_peak_N and area_mm2,
+    written once per coupon by Level-1 (never repeated per row)."""
+    fp = DIC_DIR / "coupon_scalars.csv"
+    if not fp.exists():
+        return pd.DataFrame(columns=["mts_peak_N", "area_mm2"])
+    return pd.read_csv(fp).set_index("coupon")
 
 def smooth_signal(x):
     """Dispatches to the filter selected by FILTER_METHOD. No-op when
@@ -256,49 +274,58 @@ def write_specimen_sheet(rows: list[dict]) -> None:
     except PermissionError:
         print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
 
-def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove pre-load slack and post-fracture frames (Level-2 failure truncation)."""
-    f = df["force_N"].to_numpy()
-    peak = float(np.nanmax(np.abs(f)))
+def truncation_mask(force_N: np.ndarray) -> np.ndarray:
+    """Boolean mask, same length as force_N, selecting the valid test
+    window: pre-load slack and post-fracture rebound are False."""
+    n = len(force_N)
+    peak = float(np.nanmax(np.abs(force_N)))
     if peak <= 0:
-        return df
-    i_uts = int(np.nanargmax(np.abs(f)))
-    starts = np.where(np.abs(f) > LOAD_START_FRAC * peak)[0]
+        return np.ones(n, dtype=bool)
+    i_uts = int(np.nanargmax(np.abs(force_N)))
+    starts = np.where(np.abs(force_N) > LOAD_START_FRAC * peak)[0]
     i0 = int(starts[0]) if len(starts) else 0
-    post = np.where(np.abs(f[i_uts:]) < LOAD_END_FRAC * peak)[0]
+    post = np.where(np.abs(force_N[i_uts:]) < LOAD_END_FRAC * peak)[0]
     # stop one frame BEFORE the first post-UTS drop-off so the failure point
     # itself isn't kept (it corrupts the smoothing pass)
-    i1 = int(i_uts + post[0]) - 1 if len(post) else len(f) - 1
-    return df.iloc[i0:i1 + 1].reset_index(drop=True)
+    i1 = int(i_uts + post[0]) - 1 if len(post) else n - 1
+    mask = np.zeros(n, dtype=bool)
+    mask[i0:i1 + 1] = True
+    return mask
 
 
 # =============================================================================
 # COMPUTE PROPERTIES
 # =============================================================================
-def compute_properties(df):
+def compute_properties(eps_axial, sig, eps_transverse,
+                       eps_axial_unsmoothed=None, sig_unsmoothed=None):
     """
-    D638-compliant property extraction.
+    D638-compliant property extraction from one coupon's truncated (and, if
+    enabled, smoothed) axial-strain / stress / transverse-strain arrays.
 
     Returns a dict with E_GPa, eps_toe (toe-correction offset applied),
     sigma_y_MPa, eps_y, UTS_MPa, eps_at_UTS, poisson_chord, poisson_slope,
-    plus i_uts (index of UTS in the original arrays). Also returns the
-    toe-corrected eps/sig/eps_t arrays (smoothed, if APPLY_SMOOTHING is on)
-    and their pre-smoothing counterparts (eps_raw/sig_raw) for Level-3's
-    diagnostic overlay.
+    the toe-corrected _eps/_sig/_eps_t arrays, a _valid boolean mask (which
+    input rows survived the finite-value filter — needed by the caller to
+    scatter these arrays back into the full per-frame file), and, when
+    eps_axial_unsmoothed/sig_unsmoothed were given, their toe-corrected
+    pre-smoothing counterparts _eps_raw/_sig_raw for Level-3's diagnostic
+    overlay (identical to _eps/_sig when smoothing is off).
     """
-    df = df.dropna(subset=["strain_axial", "stress_MPa"]).reset_index(drop=True)
-    if len(df) < 10:
+    eps_axial = np.asarray(eps_axial, dtype=float)
+    sig = np.asarray(sig, dtype=float)
+    eps_transverse = np.asarray(eps_transverse, dtype=float)
+
+    valid = np.isfinite(eps_axial) & np.isfinite(sig)
+    if valid.sum() < 10:
         return None
 
-    eps_raw   = df["strain_axial"].to_numpy()
-    sig       = df["stress_MPa"].to_numpy()
-    eps_t_raw = (df["strain_transverse"].to_numpy()
-                 if "strain_transverse" in df.columns
-                 else np.full_like(eps_raw, np.nan))
-    # Pre-smoothing reference, carried through only for Level-3's diagnostic
-    # overlay — not used in any property calculation.
-    eps_unsmoothed = df["strain_axial_raw"].to_numpy() if "strain_axial_raw" in df.columns else None
-    sig_unsmoothed = df["stress_MPa_raw"].to_numpy()   if "stress_MPa_raw"   in df.columns else None
+    eps_raw   = eps_axial[valid]
+    sig       = sig[valid]
+    eps_t_raw = eps_transverse[valid]
+    eps_unsmoothed = (np.asarray(eps_axial_unsmoothed, dtype=float)[valid]
+                       if eps_axial_unsmoothed is not None else None)
+    sig_unsmoothed = (np.asarray(sig_unsmoothed, dtype=float)[valid]
+                       if sig_unsmoothed is not None else None)
 
     # ---- 1. Modulus (D638 §11.4) --------------------------------------------
     lo, hi = MODULUS_STRAIN_RANGE
@@ -332,12 +359,12 @@ def compute_properties(df):
     # First crossing of σ-ε curve with the line σ = E·(ε − YIELD_OFFSET).
     sigma_y, eps_y = np.nan, np.nan
     diff  = sig - E_MPa * (eps - YIELD_OFFSET)
-    valid = np.where(eps > YIELD_OFFSET)[0]
-    if len(valid) > 1:
-        d = diff[valid]
+    valid_y = np.where(eps > YIELD_OFFSET)[0]
+    if len(valid_y) > 1:
+        d = diff[valid_y]
         crossings = np.where(np.diff(np.sign(d)) < 0)[0]
         if len(crossings):
-            k = valid[crossings[0]]
+            k = valid_y[crossings[0]]
             denom = diff[k] - diff[k+1]
             f = diff[k] / denom if denom != 0 else 0.0
             eps_y   = float(eps[k] + f * (eps[k+1] - eps[k]))
@@ -369,9 +396,9 @@ def compute_properties(df):
         "_eps":          eps,        # toe-corrected strain, used in property calcs
         "_sig":          sig,
         "_eps_t":        eps_t,
-        "_i_uts":        i_uts,
         "_eps_raw":      eps_unsmoothed_corr,  # diagnostic overlay only
         "_sig_raw":      sig_unsmoothed,
+        "_valid":        valid,      # which input rows survived the finite-value filter
     }
 
 
@@ -384,41 +411,51 @@ def main():
     print("DIC_Level2 — scale, truncate, smooth, compute D638 properties")
     print("=" * 70)
     rows = []
+    scalars = load_coupon_scalars()
 
     for cid in selected_coupons():
-        l1 = find_l1(cid)
-        if l1 is None:
-            print(f"[{cid}] no _L1.csv — run Level 1 first")
+        frames_fp = find_frames_csv(cid)
+        if frames_fp is None:
+            print(f"[{cid}] no per-coupon CSV — run Level 1 first")
             continue
-        df = pd.read_csv(l1)
+        df = pd.read_csv(frames_fp)
+        n = len(df)
+        load_raw = df["load_raw"].to_numpy()
 
-        # ---- scale load_raw -> force_N -> stress_MPa --------------------
-        raw_peak = float(np.nanmax(np.abs(df["load_raw"].to_numpy())))
-        if "mts_peak_N" in df.columns and raw_peak > 0:
-            mts_peak = float(df["mts_peak_N"].iloc[0])
+        # ---- scale load_raw -> force_N --------------------------------------
+        raw_peak = float(np.nanmax(np.abs(load_raw)))
+        mts_peak = (float(scalars.loc[cid, "mts_peak_N"])
+                    if cid in scalars.index and pd.notna(scalars.loc[cid, "mts_peak_N"])
+                    else None)
+        area = (float(scalars.loc[cid, "area_mm2"])
+                if cid in scalars.index and pd.notna(scalars.loc[cid, "area_mm2"])
+                else np.nan)
+        if mts_peak is not None and raw_peak > 0:
             scale = mts_peak / raw_peak
             print(f"[{cid}] per-coupon scale: {scale:.4f} N/unit  (MTS {mts_peak:.0f} N)")
         else:
             scale = SCALE_N_PER_UNIT
             print(f"[{cid}] combined scale: {scale:.4f} N/unit")
-        area = float(df["area_mm2"].iloc[0]) if "area_mm2" in df.columns else np.nan
-        df["force_N"]    = df["load_raw"].to_numpy() * scale
-        df["stress_MPa"] = df["force_N"] / area if np.isfinite(area) else np.nan
+        force_N_all = load_raw * scale
 
-        df = truncate_df(df)
+        # ---- failure truncation ---------------------------------------------
+        kept = truncation_mask(force_N_all)
+        kept_idx = np.flatnonzero(kept)
 
-        # Keep pre-smoothing copies (still truncated) for Level-3's
-        # diagnostic overlay.
-        df["stress_MPa_raw"]   = df["stress_MPa"]
-        df["strain_axial_raw"] = df["strain_axial"]
+        force_kept    = force_N_all[kept]
+        stress_kept   = force_kept / area if np.isfinite(area) else np.full(kept.sum(), np.nan)
+        eps_a_kept    = df["strain_axial_raw"].to_numpy()[kept]
+        eps_t_kept    = df["strain_transverse_raw"].to_numpy()[kept]
 
-        df["force_N"]      = smooth_signal(df["force_N"].to_numpy())
-        df["stress_MPa"]   = df["force_N"] / area if np.isfinite(area) else np.nan
-        df["strain_axial"] = smooth_signal(df["strain_axial"].to_numpy())
-        if "strain_transverse" in df.columns:
-            df["strain_transverse"] = smooth_signal(df["strain_transverse"].to_numpy())
+        # Smoothing pass (no-op unless APPLY_SMOOTHING is on) — kept
+        # pre-smoothing copies alongside for Level-3's diagnostic overlay.
+        force_smoothed  = smooth_signal(force_kept)
+        stress_smoothed = force_smoothed / area if np.isfinite(area) else np.full(kept.sum(), np.nan)
+        eps_a_smoothed  = smooth_signal(eps_a_kept)
+        eps_t_smoothed  = smooth_signal(eps_t_kept)
 
-        p = compute_properties(df)
+        p = compute_properties(eps_a_smoothed, stress_smoothed, eps_t_smoothed,
+                               eps_axial_unsmoothed=eps_a_kept, sig_unsmoothed=stress_kept)
         if not p:
             print(f"[{cid}]  insufficient data")
             continue
@@ -430,19 +467,22 @@ def main():
               f"ν_chord={p['poisson_chord']:.3f}  "
               f"toe={p['eps_toe']*100:.3f}%")
 
-        # ---- write per-frame curve CSV for Level-3 plotting --------------
-        n_frames = len(p["_eps"])
-        eps_raw_col = p["_eps_raw"] if p["_eps_raw"] is not None else np.full(n_frames, np.nan)
-        sig_raw_col = p["_sig_raw"] if p["_sig_raw"] is not None else np.full(n_frames, np.nan)
-        pd.DataFrame({
-            "step":    np.arange(n_frames),
-            "eps":     p["_eps"],
-            "sig":     p["_sig"],
-            "eps_t":   p["_eps_t"],
-            "i_uts":   p["_i_uts"],
-            "eps_raw": eps_raw_col,
-            "sig_raw": sig_raw_col,
-        }).to_csv(DIC_DIR / f"{cid}_L2.csv", index=False, float_format="%.6g")
+        # ---- scatter L2 columns back onto the full per-frame file -----------
+        final_idx = kept_idx[p["_valid"]]
+
+        def scatter(values):
+            col = np.full(n, np.nan)
+            col[final_idx] = values
+            return col
+
+        df["kept"]                     = kept
+        df["force_N"]                  = scatter(force_smoothed[p["_valid"]])
+        df["stress_MPa"]               = scatter(p["_sig"])
+        df["strain_axial"]             = scatter(p["_eps"])
+        df["strain_transverse"]        = scatter(p["_eps_t"])
+        df["stress_MPa_unsmoothed"]    = scatter(p["_sig_raw"])
+        df["strain_axial_unsmoothed"]  = scatter(p["_eps_raw"])
+        df.to_csv(frames_fp, index=False, float_format="%.6g")
 
         rows.append({"coupon": cid, **{k: v for k, v in p.items() if not k.startswith("_")}})
 
@@ -458,7 +498,7 @@ def main():
                        .agg(["mean", "std", "count"]))
         group.to_csv(DIC_DIR / "level2_group_stats.csv")
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*_L2.csv, {SPECIMEN_SHEET.name}, "
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
               f"DIC/level2_group_stats.csv")
 
     print(f"\nDone. {time.time()-t0:.1f} s")

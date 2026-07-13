@@ -11,8 +11,13 @@ computed here directly from the raw MTS files (bearing has no DIC/Level-2
 step of its own).
 
 INPUT per coupon
-  <DIC_DIR>/<coupon_id>_L2.csv   step, eps, sig, eps_t, i_uts, eps_raw, sig_raw
-                                 (written by DIC_Level2.py)
+  <DIC_DIR>/<coupon_id>.csv      Level-1's per-frame record with Level-2's columns
+                                 appended (kept, force_N, stress_MPa, strain_axial,
+                                 strain_transverse, stress_MPa_unsmoothed,
+                                 strain_axial_unsmoothed) — written by DIC_Level1.py
+                                 and DIC_Level2.py. Only kept==True rows are used;
+                                 i_uts (index of UTS) is derived here via argmax,
+                                 not stored.
   FSR-SpecimenTesting.xlsx       scalar properties (E, toe strain, yield
                                  stress/strain, UTS, strain at UTS, Poisson's
                                  ratio), one row per coupon, matched by
@@ -54,7 +59,7 @@ FIGS_ROOT = Path(
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\figs"
 )
-DIC_DIR = FIGS_ROOT.parent / "DIC"   # per-frame _L2.csv files written by Level 2
+DIC_DIR = FIGS_ROOT.parent / "DIC"   # per-frame CSVs written by Level 1, appended to by Level 2
 MTS_DIR = FIGS_ROOT.parent / "MTS"   # raw MTS .txt files (group MTS plot only)
 SPECIMEN_SHEET = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
@@ -151,8 +156,8 @@ def parse_id(cid):
     part = cid.split("-")[1]
     return part[1:-2], part[-2:]
 
-def find_l2(cid):
-    p = DIC_DIR / f"{cid}_L2.csv"
+def find_frames_csv(cid):
+    p = DIC_DIR / f"{cid}.csv"
     return p if p.exists() else None
 
 def load_specimen_scalars() -> pd.DataFrame:
@@ -163,23 +168,35 @@ def load_specimen_scalars() -> pd.DataFrame:
     cols = {c: inverse[c] for c in df.columns if c in inverse}
     return df.rename(columns=cols)[list(cols.values())]
 
+def load_kept_curve(cid) -> pd.DataFrame | None:
+    """Read a coupon's per-frame CSV and return only the rows Level-2 kept
+    inside its truncated analysis window (kept == True)."""
+    fp = find_frames_csv(cid)
+    if fp is None:
+        return None
+    df = pd.read_csv(fp)
+    if "kept" not in df.columns:
+        return None
+    return df.loc[df["kept"].astype(bool)].reset_index(drop=True)
+
 def load_props(cid, scalars: pd.DataFrame):
     """Combine the per-frame curve CSV with this coupon's scalar row into
     the same props dict shape DIC_Level2.py's compute_properties() used to
     hand to the plotter."""
-    l2 = find_l2(cid)
-    if l2 is None or cid not in scalars.index:
+    curve = load_kept_curve(cid)
+    if curve is None or curve.empty or cid not in scalars.index:
         return None
-    curve = pd.read_csv(l2)
     row = scalars.loc[cid]
     props = {k: float(row[k]) if pd.notna(row[k]) else np.nan
               for k in SPECIMEN_SHEET_COLUMNS}
-    props["_eps"]     = curve["eps"].to_numpy()
-    props["_sig"]     = curve["sig"].to_numpy()
-    props["_eps_t"]   = curve["eps_t"].to_numpy()
-    props["_i_uts"]   = int(curve["i_uts"].iloc[0])
-    props["_eps_raw"] = curve["eps_raw"].to_numpy() if "eps_raw" in curve.columns else None
-    props["_sig_raw"] = curve["sig_raw"].to_numpy() if "sig_raw" in curve.columns else None
+    props["_eps"]     = curve["strain_axial"].to_numpy()
+    props["_sig"]     = curve["stress_MPa"].to_numpy()
+    props["_eps_t"]   = curve["strain_transverse"].to_numpy()
+    props["_i_uts"]   = int(np.nanargmax(props["_sig"]))
+    props["_eps_raw"] = (curve["strain_axial_unsmoothed"].to_numpy()
+                          if "strain_axial_unsmoothed" in curve.columns else None)
+    props["_sig_raw"] = (curve["stress_MPa_unsmoothed"].to_numpy()
+                          if "stress_MPa_unsmoothed" in curve.columns else None)
     return props
 
 # =============================================================================
@@ -361,15 +378,14 @@ def group_load_dic_coupons(scalars: pd.DataFrame):
     for cid in selected_coupons():
         if cid in DIC_EXCLUDE:
             continue
-        l2 = find_l2(cid)
-        if l2 is None or cid not in scalars.index:
+        df = load_kept_curve(cid)
+        if df is None or df.empty or cid not in scalars.index:
             continue
         exp, d_str = parse_id(cid)
-        df = pd.read_csv(l2)
-        i_uts = int(df["i_uts"].iloc[0])
+        i_uts = int(np.nanargmax(df["stress_MPa"].to_numpy()))
         sl = slice(0, i_uts + 1)
-        ef = df["eps"].to_numpy()[sl]
-        sf = df["sig"].to_numpy()[sl]
+        ef = df["strain_axial"].to_numpy()[sl]
+        sf = df["stress_MPa"].to_numpy()[sl]
 
         row = scalars.loc[cid]
         coupons.append({
@@ -829,7 +845,7 @@ def main():
         for cid in selected_coupons():
             props = load_props(cid, scalars)
             if props is None:
-                print(f"[{cid}] no _L2.csv or no specimen-sheet row — run Level 2 first")
+                print(f"[{cid}] no per-coupon CSV, no kept rows, or no specimen-sheet row — run Level 2 first")
                 continue
 
             print(f"[{cid}]  E={props['E_GPa']:.2f} GPa  "
