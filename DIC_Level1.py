@@ -784,7 +784,9 @@ def main():
 
     summary = []
     scalar_rows = []
-    for cid in coupons:
+    n_coupons = len(coupons)
+    for i, cid in enumerate(coupons, start=1):
+        t_coupon0 = time.time()
         try:
             stats, scalar_row = process_coupon(cid, spec)
             summary.append(stats)
@@ -792,6 +794,12 @@ def main():
                 scalar_rows.append(scalar_row)
         except Exception as ex:
             print(f"[{cid}] [error] {ex}")
+
+        elapsed = time.time() - t0
+        avg_per_coupon = elapsed / i
+        remaining = avg_per_coupon * (n_coupons - i)
+        print(f"  [{i}/{n_coupons}] {time.time()-t_coupon0:.1f} s this coupon | "
+              f"elapsed {elapsed:.1f} s | ETA {remaining:.1f} s remaining")
         print()
 
     if DO_BUILD_L1:
