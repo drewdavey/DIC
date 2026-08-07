@@ -45,6 +45,27 @@ standalone files have been removed. `matlab/tensile_plots.m` and
 part of Level 3's plotting, kept for reference; they are not run as part
 of this pipeline and aren't guaranteed to stay in sync with it.
 
+**Outside the pipeline**: `mts_quick_plots.py` is a standalone first-look
+script — MTS channels only, no DIC, no property extraction. It plots force
+–displacement and stress–strain for all three test types (one figure each,
+colour by exposure, linestyle by orientation) straight from the raw `.txt`
+files plus the geometry columns in `FSR-SpecimenTesting.xlsx`. Use it to eyeball
+a batch; use Level 1–3 for anything quotable. Two things it documents that the
+pipeline scripts don't:
+
+- The **flexural load cell carries a ~862 N tare offset** (the loading nose /
+  platen hanging on an un-tared cell). It shows as a constant 862 ± 3 N held
+  over ~1.6 mm of approach travel on all 12 flexural specimens in both
+  orientations, and left in it inflates flexural strength ~1.6×. The script
+  detects and removes it (`find_force_baseline`); `--keep-tare` disables that.
+  Tensile and bearing records don't have it.
+- `FLEX_SPAN_MM = 203.2` (8.00 in, D790 16:1) is an **assumption** — no
+  record of the fixture setting exists in the repo or the workbook. It is
+  corroborated, not confirmed: at that span the flexural moduli from the ramp
+  slopes are 6.6 GPa (0°) and 3.43 GPa (90°) against the workbook's tensile
+  6.91 / 3.57 GPa. Slope is offset-independent, so that check is on the span
+  alone. Verify against the fixture before quoting flexural numbers.
+
 ---
 
 ## Level 1 — `DIC_Level1.py`
