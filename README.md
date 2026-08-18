@@ -1,16 +1,76 @@
-# DIC Analysis Pipeline — FSR Tensile Coupons
+# DIC Analysis Pipeline — FSR Test Coupons
 
-Three-stage pipeline that turns raw VIC-3D DIC exports and MTS load-frame
-data into ASTM D638 mechanical properties and plots. Run in order:
-`DIC_Level1.py` → `DIC_Level2.py` → `DIC_Level3.py`.
+Turns raw VIC-3D DIC exports and MTS load-frame data into ASTM mechanical
+properties and plots. **Two pipelines**, one per test type, sharing the same
+level structure, the same per-coupon-CSV convention, and the same output
+directory:
 
-Flexural (ASTM D790) coupons are **not** handled by these three scripts. See
-`Flexural_tmp.py` below — a standalone end-to-end worked example for one bend
-coupon, kept separate until its method is settled.
+| | scripts | standard | status |
+|---|---|---|---|
+| **Tensile** | `TensileDIC_Level1.py` → `TensileDIC_Level2.py` → `TensileDIC_Level3.py` | ASTM D638 | complete |
+| **Flexural** | `FlexuralDIC_Level1.py` → `FlexuralDIC_Level2.py` | ASTM D790 | Levels 1–2; **no Level 3 yet** |
 
-Coupon IDs follow the pattern `P01-T<EXPOSURE><DIRECTION>-<REPLICATE>`,
-e.g. `P01-TCL00-01` (Print 01, Control exposure, 0° direction, replicate 1).
-Exposures: `CL` (Control), `SW` (Seawater), `UV`, `IS` (In-Situ).
+Run each pipeline's levels in order. The two never read or write each other's
+files — coupon IDs keep them apart — so a flexural run cannot disturb tensile
+results and vice versa.
+
+Pin-bearing (ASTM D953) coupons have **no DIC step at all**; their statistics
+are computed straight from the raw MTS files inside `TensileDIC_Level3.py`.
+
+Coupon IDs follow the pattern `P01-<TYPE><EXPOSURE><DIRECTION>-<REPLICATE>`,
+e.g. `P01-TCL00-01` (Print 01, **T**ensile, Control exposure, 0° direction,
+replicate 1). Type: `T` tensile, `F` flexural, `B` bearing. Exposures: `CL`
+(Control), `SW` (Seawater), `UV`, `IS` (In-Situ). Only `CL` and `IS` were
+bend-tested, and only at `00`/`90` — 12 flexural coupons in all.
+
+---
+
+## ⚠ The P01 DIC sync CSVs carry bad analog data — all three test types
+
+Every P01 coupon's per-coupon VIC sync CSV (`<coupon_dir>/<folder>.csv`) has
+unreliable analog channels: there was a **connection issue** during the batch.
+This is the single most important thing to know before reading either pipeline,
+because it is why the two derive force so differently.
+
+The sync CSV's one *good* column is its clock. `Time_0_0` is a real epoch
+timestamp stamped on each frame trigger, and it is the only thing that puts the
+DIC frames on a time axis at all. Everything else in that file is suspect.
+
+**Tensile** — the load channel is trustworthy in *shape* but not in scale, so
+it is rescaled. `TensileDIC_Level2.py` does this on peak alone
+(`mts_peak_N / max(|load_raw|)`); `TensileDIC_Level2_tmp.py` goes further and
+maps the entire raw MTS series onto the frames by anchoring the two peak-force
+rows and back-tracking to the start of test.
+
+**Flexural** — worse: there is **no load channel at all**. `Dev1/ai2`, the
+input the DAQ config labels LOAD, is a scaled copy of `Dev1/ai1` (the
+displacement input) at r > 0.99 — nothing was wired to it, so what appears on
+it is multiplexer crosstalk from the input beside it. It shows no touchdown
+knee where the MTS sits flat on its tare, and it ramps at 81–103 % of its
+loaded rate during the approach travel. A load cell cannot do that. Peak
+anchoring is therefore not available either, so the flexural pipeline aligns on
+the **last correlated frame** instead — see Flexural Level 1 below. Force comes
+entirely from the MTS load cell.
+
+**Bearing** — no DIC step exists, so nothing depends on it.
+
+*Worth fixing before the next batch*: wire the load-cell analog output to an
+input, and either slow the DAQ scan rate or leave a grounded channel between
+the two live inputs to kill the ghosting. The tensile batch has the same
+crosstalk; it is only harmless there because the ghost lands on an unused
+channel.
+
+**Frame rate.** All flexural DIC recordings should be 5 Hz. Verified: all 12
+coupons measure 5.000 Hz median on `Time_0_0`. Four of them (`FCL9001`,
+`FIS9001`, `FIS9002`, `FIS9003`) have a handful of short intervals — dropped or
+early triggers — but the median is unaffected. Flexural Level 1 checks the rate
+per coupon against `EXPECTED_FRAME_RATE_HZ` and warns rather than assuming;
+either way it works from each coupon's own measured clock, so a coupon that
+drifts off 5 Hz still processes correctly.
+
+---
+
+## Tensile pipeline — ASTM D638
 
 **Pipeline split**: Level 1 extracts the raw DIC fields *and* pairs them
 with the MTS load frame into a per-coupon stress/strain-ready record
@@ -42,41 +102,16 @@ kept rows — recomputing it is cheaper than storing and keeping it in sync.
 
 **Merge history**: `tensile_group_plots.py`, `printStatsAll.py`, and
 `force_displacement_signal_plots.py` used to be separate scripts. Their
-functionality now lives inside `DIC_Level3.py` (group plots + stat tables)
-and `DIC_Level1.py` (Step C, raw-signal plots), respectively — those
+functionality now lives inside `TensileDIC_Level3.py` (group plots + stat tables)
+and `TensileDIC_Level1.py` (Step C, raw-signal plots), respectively — those
 standalone files have been removed. `matlab/tensile_plots.m` and
 `matlab/bearing_plots.m` are an independent MATLAB re-implementation of
 part of Level 3's plotting, kept for reference; they are not run as part
 of this pipeline and aren't guaranteed to stay in sync with it.
 
-**Outside the pipeline**: `mts_quick_plots.py` is a standalone first-look
-script — MTS channels only, no DIC, no property extraction. It plots force
-–displacement and stress–strain for all three test types (one figure each,
-colour by exposure, linestyle by orientation) straight from the raw `.txt`
-files plus the geometry columns in `FSR-SpecimenTesting.xlsx`. Use it to eyeball
-a batch; use Level 1–3 for anything quotable. Two things it documents that the
-pipeline scripts don't:
-
-- The **flexural load cell carries a ~862 N tare offset** (the loading nose /
-  platen hanging on an un-tared cell). It shows as a constant 862 ± 3 N held
-  over ~1.6 mm of approach travel on all 12 flexural specimens in both
-  orientations, and left in it inflates flexural strength ~1.6×. The script
-  detects and removes it (`find_force_baseline`); `--keep-tare` disables that.
-  Tensile and bearing records don't have it.
-- `FLEX_SPAN_MM = 203.2` (8.00 in, D790 16:1) is an **assumption** — no
-  record of the fixture setting exists in the repo or the workbook. It is
-  corroborated, not confirmed: at that span the flexural moduli from the ramp
-  slopes are 6.6 GPa (0°) and 3.43 GPa (90°) against the workbook's tensile
-  6.91 / 3.57 GPa. Slope is offset-independent, so that check is on the span
-  alone. Verify against the fixture before quoting flexural numbers.
-  `Flexural_tmp.py` (below) now **measures** the span off the DIC curvature
-  diagram: 200.0 ± 1.2 mm extrapolated to zero load on P01-FCL00-01, i.e.
-  −1.6 % against the assumption, and shrinking to 190.9 mm by peak load as the
-  contact points ride inboard over the support rollers.
-
 ---
 
-## Level 1 — `DIC_Level1.py`
+### Level 1 — `TensileDIC_Level1.py`
 
 **Step A** — converts raw VIC-3D `.out` files into per-frame CSVs, written
 next to each `.out` file in its coupon's raw-data folder.
@@ -161,7 +196,7 @@ the fast one):
 
 ---
 
-## Level 2 — `DIC_Level2.py`
+### Level 2 — `TensileDIC_Level2.py`
 
 Reads Level-1's per-coupon CSVs, scales raw load to force/stress, applies
 failure truncation, and computes ASTM D638 mechanical properties. No
@@ -234,7 +269,7 @@ plotting here (see Level 3).
 - `<DIC_DIR>/level2_group_stats.csv` — D638 §11.7 mean/std/count per
   (exposure, direction) group.
 
-### Variant — `DIC_Level2_tmp.py`
+#### Variant — `TensileDIC_Level2_tmp.py`
 
 A one-off alternate Level-2 run, used when the DIC sync CSV's own "Load"
 channel for a batch is only trustworthy as a *shape* and its peak-only
@@ -245,12 +280,12 @@ peak-force row are treated as the same physical instant (the two files
 don't share a clock), and each DIC frame's time offset from that anchor
 is used to interpolate MTS force/displacement at the matching MTS-clock
 time. Truncation, optional smoothing, and property calculations are
-otherwise identical to `DIC_Level2.py`, and it writes to the exact same
+otherwise identical to `TensileDIC_Level2.py`, and it writes to the exact same
 files (the per-coupon CSV, `FSR-SpecimenTesting.xlsx`,
-`level2_group_stats.csv`) — running it after `DIC_Level2.py` overwrites
+`level2_group_stats.csv`) — running it after `TensileDIC_Level2.py` overwrites
 Level 2's results with this method's. It also adds one column of its own,
 `disp_mm_mts` (the peak-anchored MTS displacement it derives), without
-touching Level-1's own `disp_mm` column. `DIC_Level2.py` itself is never
+touching Level-1's own `disp_mm` column. `TensileDIC_Level2.py` itself is never
 modified by running this; it remains the standard pipeline for future
 batches. Needs the same raw DIC sync CSVs as Level 1 (`DATA_ROOTS`,
 pointing at `DIC_DIR/raw/...`) plus `MTS_DIR`, in addition to Level-2's
@@ -258,7 +293,7 @@ usual per-coupon CSV input.
 
 ---
 
-## Level 3 — `DIC_Level3.py`
+### Level 3 — `TensileDIC_Level3.py`
 
 Plot- and stats-only. Reads Level-2's per-frame curve CSVs and the scalar
 properties Level-2 already wrote into `FSR-SpecimenTesting.xlsx`, and
@@ -327,117 +362,401 @@ step of its own.
 
 ---
 
-## Flexural — `Flexural_tmp.py`
+## Flexural pipeline — ASTM D790
 
-**Not part of the pipeline above, and it modifies none of it.** A standalone,
-self-contained worked example of the whole DIC + MTS chain for one 3-point-bend
-(ASTM D790) coupon, `P01-FCL00-01`, written so the method can be checked end to
-end before any of it is folded into `DIC_Level1/2/3.py`. It runs the same three
-stages inlined (`DO_STAGE1/2/3`), writes only to new paths, and never touches
-`FSR-SpecimenTesting.xlsx`.
+Two levels so far, mirroring the tensile pipeline's split and conventions:
+`FlexuralDIC_Level1.py` → `FlexuralDIC_Level2.py`. **Bare bones on purpose** —
+the structure is in place and the numbers are validated, but the plotting and
+reporting layer is deliberately absent so results can be added one at a time.
 
-**Why it isn't just Level 1–3 with different constants.** The tensile pipeline
-reduces each frame to two virtual point extensometers, which is the wrong
-reduction for a bend test. The flexural ROI is the *side profile* — the 0.50 in
-depth seen edge-on over the full span — so each frame carries the entire bending
-kinematic field. Each frame is reduced instead to midspan deflection (referenced
-to the chord through the two supports, which removes rigid settling and fixture
-tilt), curvature and neutral-axis height from a straight-line fit of `exx`
-against `Y` at midspan, and the extreme-fibre strains that fit extrapolates to
-the two faces. The ROI is inset from both faces by the correlation subset radius
-— 7.68 of 12.50 mm here, 61 % — so the surface strain D790 asks for is never
-directly measured.
+**One CSV per coupon, columns appended as it moves through the levels** —
+exactly the tensile convention. Level 1 writes `<DIC_DIR>/<coupon_id>.csv`, one
+row per DIC frame, untruncated; Level 2 reads that same file and appends its
+own columns in place. Truncation sets a boolean `kept` column rather than
+dropping rows. Per-coupon scalars live once each in
+`<DIC_DIR>/flexural_geometry.csv` (Level 1) and
+`<DIC_DIR>/flexural_properties.csv` (Level 2). Flexural and tensile per-coupon
+CSVs share the same `DIC_DIR` and never collide, because the coupon IDs differ
+(`P01-F…` vs `P01-T…`).
+
+**Why this isn't the tensile pipeline with different constants.** The tensile
+pipeline reduces each frame to two virtual point extensometers, which is the
+wrong reduction for a bend test. The flexural ROI is the *side profile* — the
+0.50 in specimen depth seen edge-on over the full span — so each frame carries
+the entire bending kinematic field. Each frame is reduced instead to midspan
+deflection (referenced to the chord through the two supports, which removes
+rigid settling and fixture tilt), curvature and neutral-axis height from a
+straight-line fit of `exx` against `Y` at midspan, and the extreme-fibre strains
+that fit extrapolates to the two faces. The ROI is inset from both faces by the
+correlation subset radius — 7.68 of 12.50 mm on `P01-FCL00-01`, 61 % — so the
+surface strain D790 asks for is never directly measured.
 
 **Three strain channels are carried side by side, and they are meant to
-disagree**: `eps_curv` (κ·d/2, DIC only, no span in it), `eps_defl` (6Dd/L²,
-D790 Eq. 4, needs the span), `eps_crosshead` (same from MTS travel, so it also
-carries machine compliance and support indentation). `eps_curv` is the
-reference; the two gaps are printed and are the point of the exercise. On
-P01-FCL00-01 the deflection modulus runs 10.9 % below the curvature modulus and
-the crosshead one 12.8 % below — that gap is D790's kinematics being tested, not
-noise.
+disagree**: `eps_curvature` (κ·d/2, DIC only, no span in it), `eps_deflection`
+(6Dd/L², D790 Eq. 4, needs the span), `eps_crosshead` (same from MTS travel, so
+it also carries machine compliance and support indentation). They share one
+force and one specimen, so every difference between the curves is measurement
+method, not material. `eps_curvature` is the reference; both gaps are printed.
+On `P01-FCL00-01` the deflection modulus runs 10.9 % below the curvature
+modulus and the crosshead one 12.8 % below.
 
-**Findings on this batch that the tensile scripts' assumptions don't cover:**
-- The **span is measurable**, and is not a constant. Bending moment is zero at a
-  simple support, so each limb of the curvature-vs-position diagram runs
-  straight down to zero exactly at the support; the two zero crossings are the
-  span. Measured at six load levels it shrinks steadily (−6.0 mm/kN) as the
-  contact points migrate inboard over the rollers. The zero-load intercept is
-  the fixture setting; the value at peak is what the specimen actually had when
-  it broke. All formulas still use `FLEX_SPAN_MM` (D790 defines stress on the
-  nominal span) and the measurement is reported alongside, including how much
-  σ_fM would move if the effective span were used instead (117.2 → 110.1 MPa).
-- The **DIC sync CSV's load channel is not usable as a force here.** It carries
-  ~56 N of noise (3.7 % of peak) and departs from the MTS by +252 N — far more
-  than its noise — above ~85 % of peak. So the **MTS force is the primary
-  channel**, resampled onto the frames, and the sync channel is kept, smoothed
-  and calibrated, only as a cross-check (`force_N` vs `force_N_sync`). This is a
-  stronger statement than `DIC_Level2_tmp.py`'s: there the sync load was
-  untrustworthy in *scale*, here it is untrustworthy in shape as well.
-- **Alignment cannot be scanned for.** Force is nearly linear in time in both
-  records, and a time shift between two straight lines is absorbed exactly by a
-  regression's intercept — a 24 s sweep moves the residual by 15 % with no
-  minimum, and optimising it walked the offset 19 s off and pushed the load peak
-  out of the frame window entirely. Displacement is worse (a constant-rate
-  ramp). So alignment comes from **fracture**, taken from the images: the last
-  correlated frame. Two independent witnesses confirm it (the smoothed sync load
-  peaks at the same frame; the two crosshead-travel records then agree to
-  0.08 mm RMS over 13.9 mm).
-- The flexural **column names differ from the tensile ones** — displacement is
-  `DISP_[in]|_CH05/ai1_scaled`, not `DRIFT_…/CH06`, and load is `…CH06_/ai2`,
-  not `CH07_/ai2`. Level 1's `pick_col(sync, "drift")` would find nothing.
-- The raw folders **drop the print prefix and the dashes**: `P01-FCL00-01` lives
-  in `DIC/raw/2026_FSR_Flexural_FCL_FIS/FCL0001`, so the coupon ID cannot be
-  used to find the directory the way it can for tensile.
-- The **load-cell tare** (~860 N) is handled exactly as `mts_quick_plots.py`
-  does — `find_force_baseline()` is ported over.
+### Span — 8.00 in, confirmed
 
-**Cost / caching.** Stage 1 reads all 881 `.out` files with vicpyx (~50 s) and
-caches its per-frame reduction; Stages 2 and 3 reload that cache and finish in
-~4 s, so truncation and modulus windows can be tuned for free. Set
-`OVERWRITE_L1 = True` to rebuild. `EXPORT_FRAME_CSVS` (default off) additionally
-dumps each `.out` to a CSV next to it, the way Level 1's Step A does — nearly
-free during the Stage 1 pass, but ~1 GB per coupon and nothing here reads it.
+`FLEX_SPAN_MM = 203.2` (8.00 in, D790's 16:1 for the nominal 0.50 in depth).
+**Confirmed against the fixture.** This was an open assumption for a long time —
+no record of the setting exists in the repo or the workbook — so older notes,
+and the removed scratch scripts, hedge about it. They are out of date.
 
-**Outputs** (all new paths):
-- `<DIC_DIR>/tmp_flexural/<coupon_id>_frames.csv` — per-frame record, Stage 1
-  columns plus Stage 2's.
-- `<DIC_DIR>/tmp_flexural/<coupon_id>_geometry.csv` — the located fixture,
-  alignment, calibration and span measurements; one row.
-- `<DIC_DIR>/tmp_flexural/<coupon_id>_properties.csv` — Stage 2 scalars, one row.
-- `<FIGS_ROOT>/<coupon_id>/flex_fixture_check.png` — deflected shape, strain
-  through the depth, and the curvature/moment diagram the span is measured from.
-- `<FIGS_ROOT>/<coupon_id>/flex_force_check.png` — both force channels vs time
-  with the fracture anchor marked, and force–deflection DIC vs crosshead.
-- `<FIGS_ROOT>/<coupon_id>/flex_stress_strain.png` — the three σ–ε curves.
-- `<FIGS_ROOT>/<coupon_id>/flex_curvature_modulus.png` — M/I vs κ, and the
-  neutral-axis/R² bending-quality check.
-- `<FIGS_ROOT>/<coupon_id>/flex_exx_field.png` — full-field `exx` near peak.
+Two related numbers, not the same thing, both correct:
 
-**Still to do before this becomes Level 1–3 flexural**: run the other 11
-flexural coupons (`FCL/FIS` × `00/90` × 3), decide whether the D790 scalars go
-into `FSR-SpecimenTesting.xlsx` alongside the tensile ones or into their own
-columns, settle `FLEX_SPAN_MM` against the actual fixture, and fold the coupon
-ID → raw folder mapping and the flexural sync column names into Level 1.
+| | | |
+|---|---|---|
+| **203.2 mm** | the fixture setting — where the support rollers are | D790 defines flexural stress and strain on this nominal span, so it is what every formula here uses |
+| **~200 mm** | where the bending moment actually crosses zero at low load | measured off the DIC curvature diagram; shrinks further under load |
+
+The second is measurable because a roller cannot transmit moment, so each limb
+of the curvature-vs-position diagram runs straight down to zero exactly at the
+support, and the two zero crossings locate them. On `P01-FCL00-01` that gave
+200.0 ± 1.2 mm extrapolated to zero load, falling to 190.9 mm by peak as the
+contact points ride inboard over the rollers (−5.96 mm/kN).
+
+With the fixture now confirmed at 203.2 mm, **that 1.6 % gap is contact
+geometry, not a fixture error** — the specimen touches each roller slightly
+inboard of its centre, and rolls further inboard as it bends. Two consequences
+worth knowing:
+
+- It is *not* an error to correct. D790 defines σ and ε on the nominal span,
+  which is what the pipeline uses.
+- It does mean the `eps_deflection` − `eps_curvature` gap (−7.6 to −10.9 %
+  across the batch) can **no longer be partly attributed to a wrong span**, the
+  way the older notes did. The effective span being ~1.6 % short accounts for
+  some of it; the rest is D790's small-deflection kinematics, shear, and
+  indentation under the loading nose. `eps_curvature` has no span in it at all
+  and stays the reference regardless.
+
+The measurement itself is not yet ported into this pipeline — see the list
+below. The constant is defined separately in both levels and the two must match.
 
 ---
 
+### Level 1 — `FlexuralDIC_Level1.py`
+
+**Step A** — dumps each `.out` to a CSV next to it, the way tensile Step A
+does. **Off by default** (`DO_EXPORT_FRAMES = False`): Step B holds each frame
+in memory anyway, so nothing reads these files, and they are ~1 GB per coupon.
+
+**Step B** — reduces every `.out` frame to the bending kinematics, pairs them
+with the MTS record, and writes the per-coupon CSV. The slow step (~50–60 s per
+coupon, one vicpyx load per frame).
+
+**Step C** — reports which variables each coupon's `.out` files actually
+contain. Cheap, vicpyx-only, and the reason it exists: **run it after
+reprocessing a project in VIC-3D** to confirm new inspector items are reaching
+the export before spending an hour on Step B. It prints the full variable list,
+flags any `REQUIRED_VARS` that are absent, and lists variables that are present
+but not being read — anything in that last group can be added to
+`OPTIONAL_VARS` and it will be carried straight through Step B.
+
+**Variable handling, built for the reprocess.** `REQUIRED_VARS`
+(`sigma, X, Y, V, exx`) must be present or a frame is unusable. `OPTIONAL_VARS`
+are read when they exist and silently skipped when they don't, so adding a new
+inspector item there costs nothing on coupons that predate it. As of now every
+flexural `.out` carries the standard 21-variable VIC-3D set and no inspector
+items.
+
+**Alignment — the last correlated frame.** With no usable sync load channel
+(see the warning at the top), the two clocks cannot be aligned by peak
+anchoring the way `TensileDIC_Level2_tmp.py` does, and they cannot be aligned
+by scanning either: force is very nearly linear in time in both records, and a
+time shift between two straight lines is absorbed exactly by a regression's
+intercept, so the residual has no minimum to find. Displacement is worse — a
+constant-rate ramp is straighter still.
+
+Fracture is the one sharp event in the test, and on a bend specimen it can be
+read straight off the images: correlation is lost the instant the specimen
+cracks — *every* point in the frame goes invalid at once, not gradually — so the
+last correlated frame **is** the fracture instant, measured with no analog
+channel in it. That frame is aligned to the MTS force peak. The crosshead-travel
+cross-check is reported alongside: the sync CSV's displacement input (`ai1`, the
+one channel genuinely connected) and the MTS crosshead record measure the same
+motion by separate paths, so after alignment they should agree — 0.07–0.28 mm
+RMS over 9–14 mm of travel on the coupons run so far. That does not
+*independently* confirm the offset (a constant-rate ramp cannot), but a large
+residual would be a loud signal that the two files are not the same test.
+
+**Load-cell tare.** The flexural records open on a constant ~860 N held through
+the approach travel — the loading nose hanging on an un-tared cell. It shows on
+all 12 flexural specimens in both orientations, and left in it inflates flexural
+strength ~1.6×. `find_force_baseline()` detects and removes it (ported from
+`mts_quick_plots.py`). Tensile and bearing records don't have it.
+
+**ROI orientation check — three coupons are blocked on it.** Every reduction in
+this script assumes the VIC-3D world frame is oriented the same way on every
+coupon: `X` along the specimen (the span), `Y` through the depth. That is not
+automatic — it comes from the calibration and the alignment plane chosen when
+the project was built — and **three coupons in this batch were reconstructed on
+a different frame**:
+
+| coupon | ROI X extent | ROI Y extent | vs. depth `d` |
+|---|---|---|---|
+| `P01-FCL90-03` | 89 mm | **196 mm** | 15.2× — span and depth swapped |
+| `P01-FIS90-01` | 157 mm | **309 mm** | 24.0× — span and depth swapped |
+| `P01-FIS00-01` | 222 mm | **40 mm** | 3.2× — X is right, Y is not the depth |
+
+The other nine sit at 7.7 mm of a ~12.5 mm depth, as they should.
+
+Nothing downstream can detect this on its own, which is why it is caught here.
+Left unguarded, the curvature fit happily regresses `exx` against a coordinate
+that isn't depth and returns R² ≈ 0 with a neutral axis tens of mm off the
+specimen (+56, +140 mm on two of these), and Level 2 turns that into a
+plausible-looking row of numbers — `P01-FIS00-01` produced a 10.02 GPa modulus
+against the batch's 7.9–8.2 GPa before the check existed. So Level 1 tests the
+ROI's Y extent against the specimen depth (`ROI_DEPTH_FRAC_RANGE`) and its
+aspect ratio (`ROI_MIN_ASPECT`) and **skips the coupon, writing nothing** — a
+missing coupon is recoverable, a silently wrong one is not. The check runs
+before anything expensive, so a bad coupon costs ~1 s.
+
+**Fix at the source**: re-align those three VIC-3D projects' coordinate systems
+and re-export, then re-run Level 1. Worth doing as part of the inspector-item
+reprocess.
+
+**Fixture location.** Midspan is found as the interior extremum of the deflected
+shape — the one place along a 3-point beam where `dV/dx = 0`, by symmetry — then
+refined twice as the largest departure from the support chord. This needs no
+prior knowledge of the sign of `V` or of where the specimen sits in the world
+frame. Set `MIDSPAN_X_MM` to pin it manually instead; leaving it `None` (the
+default) is recommended, since the located position is itself a fixture check.
+The deflection sampling windows sit a few mm inboard of the supports whenever
+the ROI doesn't reach that far, where the true deflection isn't zero, so the
+midspan value is scaled back up using the ideal 3-point shape
+(`APPLY_SUPPORT_OFFSET_CORRECTION`, ~1.6 % here).
+
+**Switches**
+- `DO_LIST_VARS` — Step C. Cheap; leave on.
+- `DO_EXPORT_FRAMES` / `OVERWRITE_FRAMES` — Step A. Off by default.
+- `DO_BUILD_L1` / `OVERWRITE_L1` — Step B. `OVERWRITE_L1` defaults `False`:
+  skip coupons whose per-coupon CSV already exists.
+- `PRINTS` / `EXPOSURES` / `DIRECTIONS` / `REPLICATES` — coupon selection.
+  `EXPOSURES` is `{CL, IS}` and `DIRECTIONS` is `{00, 90}`; the other tensile
+  exposures and the 45° direction weren't bend-tested.
+
+**Inputs**
+- `<coupon_dir>/*.out` — VIC-3D full-field export, one per DIC frame.
+- `<coupon_dir>/<folder>.csv` — VIC sync CSV. **Read for `Time_0_0` only** (plus
+  the displacement channel for the alignment cross-check). None of its analog
+  channels reach the per-coupon CSV.
+- `<MTS_DIR>/<coupon_id>.txt` — MTS raw: `disp_mm, force_N, output_V, time_s`.
+- `FSR-SpecimenTesting.xlsx` — depth `d` and width `b`. Read only, never written.
+- The raw folders **drop the print prefix and the dashes**: `P01-FCL00-01` lives
+  in `DIC/raw/2026_FSR_Flexural_FCL_FIS/FCL0001`, so unlike tensile the coupon
+  ID cannot be used to find the directory directly. `raw_folder()` maps it.
+
+**Outputs**
+- `<DIC_DIR>/<coupon_id>.csv` — full per-frame record: `step, time_s, force_N,
+  disp_mts_mm, n_pts, defl_mm, kappa_1pmm, na_Y_mm, profile_r2, eps_bot,
+  eps_top, eps_membrane`. Level 2 appends to this same file.
+- `<DIC_DIR>/flexural_geometry.csv` — one row per coupon: `b_mm`, `d_mm`, the
+  located fixture (`x_mid_mm`, `x_left_mm`, `x_right_mm`, `defl_sign`), the ROI
+  and assumed face positions, `tare_mts_N`, `peak_net_N`, `frame_rate_hz`,
+  `mts_offset_s`, `break_frame`, `disp_check_rmse_mm`. The only place these
+  per-coupon scalars are stored — the analogue of tensile's
+  `coupon_scalars.csv`. Upserted, so coupons skipped on a run keep their
+  existing row.
+- `<coupon_dir>/<out_filename>.csv` — Step A only, when enabled.
+
+---
+
+### Level 2 — `FlexuralDIC_Level2.py`
+
+Reads Level-1's per-coupon CSV and `flexural_geometry.csv`, applies failure
+truncation, and computes the D790 properties. Cheap (pure pandas/numpy over an
+already-built CSV), so it always recomputes — re-run freely while tuning
+truncation and modulus windows.
+
+**What it does**
+- Truncates each record: marks pre-load slack and post-peak decay outside the
+  analysis window (`kept = False`) rather than dropping rows. Two differences
+  from the tensile version: the window additionally requires **DIC validity**,
+  since a bend specimen loses correlation at fracture several frames before the
+  load channel finishes falling; and the start is taken on the *rising edge*
+  (last sample below threshold before the peak) rather than the first sample
+  over it, because with the tare removed the pre-touchdown baseline sits on zero
+  with noise either side and a plain threshold can trigger tens of seconds early.
+- **No smoothing pass.** D790 doesn't call for filtering the stress-strain
+  record, the MTS force is the primary channel and is already clean (~0.7 % of
+  span), and the DIC-derived channels are the cleanest signals in the test.
+- Computes:
+  - **Flexural stress** (D790 §12.2 Eq. 3) — `σ = 3PL / 2bd²`, on the
+    tare-removed force.
+  - **Three flexural strains** — `eps_curvature`, `eps_deflection`,
+    `eps_crosshead`, each toe-compensated on its own.
+  - **Toe compensation** (D790 §12.1 / D638 Annex A1) — fitted **twice**,
+    because the fit window is specified in corrected strain but the correction
+    is what the fit produces. Without the second pass the tangent and chord
+    moduli are quietly measured over two different strain ranges, offset by the
+    toe, and are not comparable.
+  - **Tangent modulus** (D790 §12.4) and **chord modulus** (§12.5) on each of
+    the three channels, over 0.05–0.25 % strain.
+  - **Curvature modulus** — `E = (M/I)/κ`, fitted in moment-curvature space.
+    Not in D790; the DIC-native equivalent of `E_B`, and a check on the
+    arithmetic of `eps_curvature` (the two agree to 0.6 %).
+  - **Flexural strength** (D790 §3.2.7) — max flexural stress, with a warning if
+    the specimen did *not* break before 5 % strain (in which case D790 §12.2
+    asks for the stress at 5 % instead), and another if `D/L > 0.10` at peak,
+    where §12.3's large-deflection correction is called for.
+  - **Bending-quality diagnostics** — R² of the through-depth `exx(Y)` fit
+    (summarised only above 25 % load, since at low load the strain range is
+    below the DIC noise floor), the neutral-axis offset, and the membrane
+    strain.
+  - **Group stats** — mean/std/count per exposure × direction.
+
+**The neutral-axis offset has two causes, and they're reported separately.** A
+mis-centred ROI is a constant, present from the very first frame: an ROI offset
+by `δ` reads as a neutral axis `δ` off mid-depth and a membrane strain of
+exactly `κδ`, indistinguishable from a genuinely asymmetric specimen.
+Asymmetric material nonlinearity only develops under load. So the low-load
+baseline (`na_offset_at_low_load_mm`) and the growth above it (`na_drift_mm`)
+are stored separately — **only the drift is a statement about the material.**
+Neither touches `κ`, and therefore neither touches `eps_curvature` or any
+modulus.
+
+**Inputs**
+- `<DIC_DIR>/<coupon_id>.csv` — Level-1 output.
+- `<DIC_DIR>/flexural_geometry.csv` — Level-1's per-coupon scalars.
+
+**Outputs**
+- `<DIC_DIR>/<coupon_id>.csv` — Level-1's columns, unchanged, plus `kept`,
+  `stress_MPa`, `M_over_I_MPa_per_mm`, `eps_curvature`, `eps_deflection`,
+  `eps_crosshead` (all toe-corrected). All `NaN` where `kept` is `False`.
+- `<DIC_DIR>/flexural_properties.csv` — one row per coupon: geometry, the four
+  moduli (tangent + chord), toe offsets, `sigma_fM_MPa`, `sigma_fB_MPa`, strain
+  at max on each channel, and the bending-quality diagnostics.
+- `<DIC_DIR>/flexural_group_stats.csv` — mean/std/count per (exposure,
+  direction).
+- **`FSR-SpecimenTesting.xlsx` is NOT written.** Whether the D790 scalars belong
+  in that workbook alongside the tensile ones, and under what column names, is
+  still undecided (see below). Until it is, `flexural_properties.csv` is the
+  single source of truth for flexural scalars — deliberately *unlike* the
+  tensile pipeline, which writes its scalars into the workbook.
+
+### Level 3 — not written yet
+
+There is no `FlexuralDIC_Level3.py`. Plot from `<DIC_DIR>/<coupon_id>.csv`
+(`kept == True` rows) and `flexural_properties.csv` until there is.
+
+### Validation
+
+Levels 1–2 reproduce, exactly, the numbers from the earlier standalone
+`Flexural_tmp.py` worked example on `P01-FCL00-01`:
+
+| | |
+|---|---|
+| tare removed / net peak | 860 N / 1526 N |
+| break frame (correlation lost) | 847 of 881 |
+| MTS clock leads frames by | 25.81 s |
+| analysis window | frames 141–847, 707 of 881 kept |
+| flexural strength `σ_fM` | 117.2 MPa at 2.61 % strain |
+| `E_f` curvature / deflection / crosshead / (M/I)-vs-κ | 7.94 / 7.08 / 6.93 / 7.99 GPa |
+| through-depth fit R² | 0.9992 median above 25 % load |
+
+**All 12 coupons have been run.** Nine processed cleanly; the three listed under
+the ROI orientation check above are skipped pending a VIC-3D re-alignment. The
+nine group tightly by orientation, which is the real check that the method
+travels across coupons — mean ± std:
+
+| | n | `σ_fM` (MPa) | `E_f` curvature (GPa) | `E_f` deflection | `E_f` crosshead | strain at max |
+|---|---|---|---|---|---|---|
+| **0°** | 5 | 115.3 ± 3.7 | 8.08 ± 0.11 | 7.35 ± 0.16 | 7.01 ± 0.12 | 2.6 % |
+| **90°** | 4 | 52.7 ± 3.9 | 4.01 ± 0.09 | 3.67 ± 0.07 | 3.47 ± 0.05 | 1.5 % |
+
+The curvature modulus scatters by ~1.3 % within an orientation across two
+different exposures, and the channel gaps stay consistent coupon to coupon
+(deflection −7.6 to −10.9 %, crosshead −11.7 to −15.1 %) — they are systematic,
+as the argument above says they should be, not noise. Through-depth fit R² is
+0.998–0.9996 on all nine. The 90° modulus lines up with the 3.43–3.57 GPa the
+MTS ramp slopes and the tensile workbook give for that orientation.
+
+### Still to do
+
+- **Re-align the three blocked VIC-3D projects' coordinate systems**
+  (`FCL9003`, `FIS0001`, `FIS9001`) so `X` is the span and `Y` the depth, then
+  re-run Level 1 for them. Worth folding into the inspector-item reprocess.
+- **Reprocess the VIC-3D projects with more inspector items**, then re-check
+  Step C's variable listing and add whatever appears to `OPTIONAL_VARS`.
+- **Port the span measurement** off the curvature diagram (see the span section
+  above). No longer needed to validate the fixture — that is confirmed — but it
+  measures where the moment actually crosses zero, which is a real diagnostic of
+  contact behaviour and feeds the interpretation of the channel gaps.
+- **Decide where the D790 scalars live** — their own columns in
+  `FSR-SpecimenTesting.xlsx` alongside the tensile ones, or the properties CSV
+  as now.
+- **Write Level 3** (per-coupon and group plots, stat tables), one result at a
+  time.
+
+---
+
+## Outside the pipelines
+
+`mts_quick_plots.py` is a standalone first-look script — MTS channels only, no
+DIC, no property extraction. It plots force–displacement and stress–strain for
+all three test types (one figure each, colour by exposure, linestyle by
+orientation) straight from the raw `.txt` files plus the geometry columns in
+`FSR-SpecimenTesting.xlsx`. Use it to eyeball a batch; use the levelled
+pipelines for anything quotable. It is where the flexural load-cell tare was first
+documented, and it detects and removes the tare itself (`find_force_baseline`,
+with `--keep-tare` to disable). Its notes still describe the 8.00 in span as an
+assumption — that is now confirmed.
+
+`matlab/tensile_plots.m` and `matlab/bearing_plots.m` are an independent MATLAB
+re-implementation of part of tensile Level 3's plotting, kept for reference;
+they are not run as part of either pipeline and aren't guaranteed to stay in
+sync.
+
+---
 ## Common configuration
 
 All scripts share a `SWITCHES` block at the top (`PRINTS`, `EXPOSURES`,
 `DIRECTIONS`, `REPLICATES`) used to select which coupons to process, and
 a `PATHS` block — trimmed to only what each script actually touches.
-`DIC_Level2.py` and `DIC_Level3.py` don't need the raw-data `DATA_ROOTS`
+`TensileDIC_Level2.py` and `TensileDIC_Level3.py` don't need the raw-data `DATA_ROOTS`
 at all, since by the time they run everything they need is already in
-`DIC_DIR` or the specimen sheet; `DIC_Level2_tmp.py` is the exception —
+`DIC_DIR` or the specimen sheet; `TensileDIC_Level2_tmp.py` is the exception —
 it needs both the raw DIC sync CSVs (`DATA_ROOTS`) and `MTS_DIR`, same as
 Level 1, because it re-derives force from the raw MTS record.
 
+The flexural scripts follow the same shape. Their `EXPOSURES` is `{CL, IS}` and
+`DIRECTIONS` is `{00, 90}` — the other exposures and the 45° direction weren't
+bend-tested. `FlexuralDIC_Level2.py` needs only `DIC_DIR`; Level 1 needs
+`RAW_ROOT`, `MTS_DIR` and the specimen sheet.
+
+**`FLEX_SPAN_MM` is defined in both flexural levels and the two must match.**
+It is duplicated rather than shared because neither script imports the other —
+keeping each runnable on its own, the way the tensile levels are. If you change
+it, change it in both.
+
 ## File naming history
+
+**The tensile scripts were renamed** `DIC_Level1/2/3.py` →
+`TensileDIC_Level1/2/3.py` (and `DIC_Level2_tmp.py` →
+`TensileDIC_Level2_tmp.py`) when the flexural pipeline was added, so the two
+pipelines' file names say which test type they handle. Nothing about their
+behaviour changed. Old notes and commit messages still use the short names.
+
+The standalone flexural scratch scripts — `Flexural_tmp.py` (a self-contained
+worked example of the whole bend-test chain on one coupon),
+`Flexural_figs_tmp.py` (its figures, signal report and HTML method doc) and
+`export_fields_for_matlab.py` (a one-off `.out` → CSV export for MATLAB) — are
+**no longer in this directory**, and neither are the `flexural_walkthrough`
+`.md`/`.pdf`/`.m` notes that went with them. `FlexuralDIC_Level1/2.py` supersede
+the analysis and reproduce its numbers exactly (see Validation above). Anything
+left under `<DIC_DIR>/tmp_flexural/` is output from those scripts and is stale;
+the live flexural outputs are in `<DIC_DIR>` proper. If you still have the
+walkthrough notes elsewhere they remain the best long-form derivation of the
+method, but they describe `Flexural_tmp.py`'s file layout, not this one's.
 
 If you're looking at old notes or file listings: the consolidated
 per-coupon CSV used to be called `_L2.csv` (written by a separate
-`DIC_Level2.py` that only did the MTS/extensometer pairing), and the
+`TensileDIC_Level2.py` that only did the MTS/extensometer pairing), and the
 truncated per-frame property CSV used to be `_L3.csv` with a
 `level3_summary.csv`/`level3_group_stats.csv` pair holding scalar
 properties. That pairing step is now part of Level 1, the truncation/
