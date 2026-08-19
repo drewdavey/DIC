@@ -3,7 +3,7 @@
 DIC_Level3.py  —  FSR Tensile Coupons
 ======================================
 Plot- and stats-only. Reads Level-2's per-frame curve CSVs and the scalar
-mechanical properties Level-2 already wrote into FSR-SpecimenTesting.xlsx
+mechanical properties Level-2 already wrote into FSR-SpecimenTesting.csv
 (the single source of truth for tensile scalars — nothing tensile is
 recomputed here), and produces per-coupon plots, group overlay/summary
 plots, and mean ± std (CV%) property tables. Pin-bearing statistics are
@@ -18,7 +18,7 @@ INPUT per coupon
                                  and DIC_Level2.py. Only kept==True rows are used;
                                  i_uts (index of UTS) is derived here via argmax,
                                  not stored.
-  FSR-SpecimenTesting.xlsx       scalar properties (E, toe strain, yield
+  FSR-SpecimenTesting.csv        scalar properties (E, toe strain, yield
                                  stress/strain, UTS, strain at UTS, Poisson's
                                  ratio), one row per coupon, matched by
                                  "Specimen ID" — written by DIC_Level2.py
@@ -61,10 +61,25 @@ FIGS_ROOT = Path(
 )
 DIC_DIR = FIGS_ROOT.parent / "DIC"   # per-frame CSVs written by Level 1, appended to by Level 2
 MTS_DIR = FIGS_ROOT.parent / "MTS"   # raw MTS .txt files (group MTS plot only)
-SPECIMEN_SHEET = Path(
+# Specimen sheet. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# "Width / Dia. (in)" and "Computed Area (in²)" used to be FORMULA cells in
+# FSR-SpecimenTesting.xlsx, and openpyxl does not evaluate formulas: every time
+# a Level 2 saved its scalars back into the workbook it wrote the formula and
+# dropped the cached value, so Level 1 read those columns back as blank, wrote
+# area_mm2 = NaN, and Level 2 then reported "insufficient data" for every
+# coupon. The workbook is retired. FSR-SpecimenTesting.csv holds evaluated
+# values, needs no Excel engine, is not locked while something else has it
+# open, and is what every script in this folder now both reads and writes.
+SPECIMEN_CSV = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.csv"
 )
+
+# The CSV started life as a Windows Excel export, so its superscript characters
+# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
+# order; write_specimen_sheet re-writes the file as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # =============================================================================
 # SWITCHES
@@ -78,9 +93,24 @@ DO_PER_COUPON_PLOTS = True
 DO_GROUP_PLOTS      = True   # MTS force-disp + DIC curve/summary/peak-strength group figures
 DO_PRINT_STATS      = True   # mean ± std (CV%) tables (tensile + bearing) + P01_MechanicalStats.xlsx
 
-# TODO: restore P01-TCL45-01 once backup DIC data is loaded — excluded because
-#       its toe correction is anomalously large, distorting group curves/stats.
-#       Per-coupon plots above still include it; only the group plots below don't.
+# P01-TCL45-01 was excluded here for an "anomalously large toe correction".
+# 2026-08-29: that was a symptom, not the cause. Its DIC sync record covers only
+# 90.6 % of the MTS peak force — the recording stopped before the specimen
+# failed — so max(|load_raw|) is not the peak and the peak-anchored stress axis
+# was inflated ~10 %, which is where the large toe came from.
+#
+# TensileDIC_Level2's regressed load scale fixes this coupon's MODULUS
+# (E drops 10.8 % and comes back into family with TCL45-02/03). Its UTS and
+# strain-at-UTS are NOT recoverable — the specimen's peak was never recorded —
+# so it must stay out of any group statistic involving those. P01-TSW00-01
+# (96.3 % coverage) and P01-TSW00-02 (97.2 %) have the same defect more mildly
+# and are deliberately NOT excluded here; see the README before quoting their
+# UTS either.
+#
+# TODO: this switch is all-or-nothing per coupon. Splitting it into
+#       DIC_EXCLUDE_MODULUS / DIC_EXCLUDE_STRENGTH would let TCL45-01's now-good
+#       modulus back into the group stats while keeping its UTS out. Left as-is
+#       pending a decision on how the three truncated coupons get reported.
 DIC_EXCLUDE = {"P01-TCL45-01"}
 
 # =============================================================================
@@ -160,10 +190,25 @@ def find_frames_csv(cid):
     p = DIC_DIR / f"{cid}.csv"
     return p if p.exists() else None
 
+def read_specimen_csv() -> pd.DataFrame:
+    """The specimen sheet, whatever encoding it is still carrying.
+
+    The file started life as a Windows Excel export and the Level 2s re-write
+    it as utf-8-sig, so both spellings of "Computed Area (in²)" have to be
+    readable.
+    """
+    for enc in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(SPECIMEN_CSV, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise SystemExit(f"{SPECIMEN_CSV.name}: not decodable as "
+                     f"{'/'.join(CSV_ENCODINGS)}")
+
 def load_specimen_scalars() -> pd.DataFrame:
-    """Read scalar properties back out of SPECIMEN_SHEET, indexed by coupon,
-    with columns renamed from Excel headers back to property keys."""
-    df = pd.read_excel(SPECIMEN_SHEET).set_index("Specimen ID")
+    """Read scalar properties back out of SPECIMEN_CSV, indexed by coupon,
+    with columns renamed from sheet headers back to property keys."""
+    df = read_specimen_csv().set_index("Specimen ID")
     inverse = {label: key for key, label in SPECIMEN_SHEET_COLUMNS.items()}
     cols = {c: inverse[c] for c in df.columns if c in inverse}
     return df.rename(columns=cols)[list(cols.values())]
@@ -528,10 +573,10 @@ def group_plot_dic_peak_strength(coupons):
 # PRINT STATS — mean ± std (CV%) tables, tensile (D638) + bearing (D953)
 # =============================================================================
 def load_spec_sheet_raw() -> pd.DataFrame:
-    """Full specimen sheet with original Excel headers (not renamed), indexed
-    by Specimen ID — needed here for coupon thickness (bearing area) as well
-    as the tensile scalar columns."""
-    df = pd.read_excel(SPECIMEN_SHEET)
+    """Full specimen sheet with its original headers (not renamed), indexed by
+    Specimen ID — needed here for coupon thickness (bearing area) as well as
+    the tensile scalar columns."""
+    df = read_specimen_csv()
     if "Print ID" in df.columns:
         df = df[df["Print ID"] == PRINTS[0]]
     if "Specimen ID" in df.columns:

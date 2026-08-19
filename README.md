@@ -10,6 +10,13 @@ directory:
 | **Tensile** | `TensileDIC_Level1.py` → `TensileDIC_Level2.py` → `TensileDIC_Level3.py` | ASTM D638 | complete |
 | **Flexural** | `FlexuralDIC_Level1.py` → `FlexuralDIC_Level2.py` | ASTM D790 | Levels 1–2; **no Level 3 yet** |
 
+`tensile_modulus_sensitivity.py` sits beside the tensile pipeline rather than
+in it: it is read-only, measures how much of the scatter in E comes from
+processing choices rather than the material, and is documented under
+[Result — how much of the tensile modulus scatter is processing?](#result--how-much-of-the-tensile-modulus-scatter-is-processing)
+below. Changes made to the tensile pipeline on 2026-08-29, and the reasoning
+behind each, are in `CHANGELOG_tensile_2026-08-29.md`.
+
 Run each pipeline's levels in order. The two never read or write each other's
 files — coupon IDs keep them apart — so a flexural run cannot disturb tensile
 results and vice versa.
@@ -36,11 +43,33 @@ The sync CSV's one *good* column is its clock. `Time_0_0` is a real epoch
 timestamp stamped on each frame trigger, and it is the only thing that puts the
 DIC frames on a time axis at all. Everything else in that file is suspect.
 
+⚠ **That clock did not survive the trip into the per-coupon CSVs, and it has
+now been fixed.** Tensile Level 1 wrote `Time_0_0` verbatim through
+`to_csv(float_format="%.6g")`; six significant figures rounds a ~1.7756e9 epoch
+to the nearest 10 000 s, so **every row of every tensile per-coupon CSV written
+before 2026-08-29 carries the same `time_s`**. Level 1 now stores *elapsed
+seconds from the first frame* (spans are 40–70 s, so `%.6g` keeps
+sub-millisecond resolution) and keeps the absolute start as `t0_epoch_s` in
+`coupon_scalars.csv`. Level 2 detects a degenerate `time_s` and re-reads
+`Time_0_0` from the raw sync CSV, so it works on the old files too. The
+flexural pipeline always stored elapsed time and was never affected.
+
 **Tensile** — the load channel is trustworthy in *shape* but not in scale, so
-it is rescaled. `TensileDIC_Level2.py` does this on peak alone
-(`mts_peak_N / max(|load_raw|)`); `TensileDIC_Level2_tmp.py` goes further and
-maps the entire raw MTS series onto the frames by anchoring the two peak-force
-rows and back-tracking to the start of test.
+it is rescaled. `TensileDIC_Level2.py` now does this by **regressing** the raw
+MTS force against `load_raw` over the rising ramp (see Level 2 below); it used
+to do it on peak alone (`mts_peak_N / max(|load_raw|)`), which is still
+reachable via `LOAD_SCALE_MODE = "peak"`. `TensileDIC_Level2_tmp.py` goes
+further and maps the entire raw MTS series onto the frames by anchoring the two
+peak-force rows and back-tracking to the start of test.
+
+⚠ **Three tensile coupons have DIC records that stop before the specimen
+fails** — `P01-TCL45-01` (spans 90.6 % of the MTS peak force), `P01-TSW00-01`
+(96.3 %) and `P01-TSW00-02` (97.2 %); every other coupon is above 99.8 %. For
+those three, `max(|load_raw|)` is not the peak, so the peak-anchored scale is
+inflated by ~10 %, ~4 % and ~3 %, and their reported **UTS and strain-at-UTS
+are not the specimen's under any scale**. Level 2 detects and reports this
+(`DIC_COVERAGE_MIN`); nothing can recover it from these recordings. This is why
+`P01-TCL45-01` looked anomalous — not its toe correction.
 
 **Flexural** — worse: there is **no load channel at all**. `Dev1/ai2`, the
 input the DAQ config labels LOAD, is a scaled copy of `Dev1/ai1` (the
@@ -141,6 +170,26 @@ reruns when enabled (cheap — no vicpyx calls).
   transverse 1.0 in / 25.4 mm, per ASTM D638 §5.2.1 / Annex A3.5.2) and
   computes engineering strain from marker displacement each frame; saves a
   raw MTS force-displacement sanity-check plot.
+
+  **On the 4.36 in axial gauge**: these are *not* D638 Type I dogbones. The
+  gauge section is ~34 mm wide × ~14 mm thick (≈480 mm²; a Type I is ≈41 mm²)
+  and the correlated ROI runs 137–149 mm along the loading axis, so 110.7 mm
+  sits comfortably inside it on every P01 coupon. The 2.00 in gauge in D638
+  Fig. 1 is specified for the Type I geometry and does not carry over. (A
+  comment in the source used to claim a 50 mm gauge, contradicting the
+  constant beside it; that comment was the error, not the number.)
+
+  The extensometer carries two guards that **do not change any P01 result** —
+  both failure modes were checked against the frame CSVs and neither fires —
+  but protect a batch with worse correlation: endpoint candidates are filtered
+  on `sigma` (inert on P01, whose exports carry no `sigma` column despite
+  `EXPORT_VARS` requesting it — it takes effect only after a Step-A re-export),
+  and the two endpoints are located once in the reference frame and thereafter
+  tracked by their reference-frame coordinates rather than re-searched every
+  frame, so a lost point cannot silently substitute a neighbouring subset and
+  put a discrete step in the strain record. Both report counts if they trigger.
+  `ext_endpoints` likewise now warns when a gauge is clipped to the ROI (no P01
+  coupon clips) and the length actually used is recorded per coupon.
 - Step C: for each coupon, plots the raw MTS force/displacement vs. time,
   and a twin-axis plot of the DIC sync CSV's raw (volts) vs. scaled
   (engineering-unit) force and displacement channels side by side; then
@@ -166,7 +215,10 @@ the fast one):
 - `<coupon_dir>/*.out` — VIC-3D full-field export, one per DIC frame.
 - `<coupon_dir>/<coupon_id>.csv` — VIC sync CSV (analog channels @ DIC frame rate).
 - `<MTS_DIR>/<coupon_id>*.txt` — MTS raw file: `disp_mm, force_N, output_V, time_s`.
-- `FSR-SpecimenTesting.xlsx` — gauge thickness × width → cross-sectional area.
+- `FSR-SpecimenTesting.csv` — gauge thickness × width → cross-sectional area.
+  The **CSV**, not the `.xlsx` — see the geometry warning near the end of this
+  README. Falls back to the workbook only if the CSV can't be read, and refuses
+  outright rather than proceeding with NaN geometry.
 - `<coupon_dir>` lives under `DATA_ROOTS[exposure]`, which points at
   `DIC_DIR/raw/<project-folder>` — a local mirror of the raw VIC-3D project
   data. (Older notes may reference `G:\DrewDavey\...`; that external-drive
@@ -180,11 +232,17 @@ the fast one):
   disp_mm, load_raw, strain_axial_raw, strain_transverse_raw`. Level 2
   reads this same file and appends its own columns to it (see below).
   (`DIC_DIR` is the `DIC/` folder next to `MTS/`, not inside the coupon's
-  raw data folder.)
+  raw data folder.) `time_s` is **elapsed seconds from the first frame**, not
+  the raw epoch — see the sync-CSV warning above.
 - `<DIC_DIR>/coupon_scalars.csv` — one row per coupon: `coupon, mts_peak_N,
-  area_mm2`. The only place these two scalars are stored — Level 2 reads
-  them from here instead of finding them repeated down every row of the
-  per-frame CSV.
+  area_mm2, t0_epoch_s` (the absolute start `time_s` is measured from), and
+  `axial_gauge_mm` / `trans_gauge_mm` (the gauge lengths *actually* used, which
+  differ from the requested ones only if `ext_endpoints` clipped them to the
+  ROI). The only place these scalars are stored — Level 2 reads them from here
+  instead of finding them repeated down every row of the per-frame CSV. Written
+  with `float_format="%.12g"`, wider than the `%.6g` used elsewhere, because
+  `t0_epoch_s` is an epoch and would otherwise be rounded to the nearest
+  10 000 s — the same rounding that flattened `time_s`.
 - `<FIGS_ROOT>/<coupon_id>/MTS_force_disp.png` — raw MTS force-vs-displacement
   curve, Step B's sanity check.
 - `<FIGS_ROOT>/<coupon_id>/MTS_force_displacement_signals.png` — Step C:
@@ -203,14 +261,52 @@ failure truncation, and computes ASTM D638 mechanical properties. No
 plotting here (see Level 3).
 
 **What it does**
-- Scales `load_raw` to `force_N` using the per-coupon scale factor
-  (`mts_peak_N / max(|load_raw|)`, read from `coupon_scalars.csv` — no
-  separate calibration pass needed), falling back to a combined
-  `SCALE_N_PER_UNIT` if `mts_peak_N` is missing, and divides by `area_mm2`
-  (also from `coupon_scalars.csv`) to get `stress_MPa`.
-- Truncates each record: marks pre-load slack (load < 2% of peak) and
-  post-fracture rebound (first post-UTS frame where load < 50% of peak) as
-  outside the analysis window (`kept = False`) rather than dropping rows.
+- Scales `load_raw` to `force_N` by **regressing the raw MTS force against
+  `load_raw` over the rising ramp** (10–85 % of peak), using every point in it
+  — `LOAD_SCALE_MODE = "regress"`. It divides by `area_mm2` (from
+  `coupon_scalars.csv`) to get `stress_MPa`.
+
+  **Why this replaced the peak ratio.** The old rule
+  (`mts_peak_N / max(|load_raw|)`, still available as
+  `LOAD_SCALE_MODE = "peak"`) set the entire stress axis — and therefore E, UTS
+  and yield, all linearly — from the ratio of two single samples: the largest
+  of a few thousand noisy MTS samples over the largest of a few thousand noisy
+  sync samples, from two records that don't share a clock. Both maxima are
+  biased high by their own noise floors and there is no reason the biases
+  match. The load cell and DAQ gain are hardware constants, so every coupon in
+  a batch must return the same scale. Measured over the 35 P01 tensile coupons:
+
+  | | mean | CV | range |
+  |---|---|---|---|
+  | peak ratio | 555.3 | **2.55 %** | 540.0 – 613.8 |
+  | regressed | 559.4 | **0.71 %** | 551.0 – 566.6 |
+
+  The fitted **intercept is deliberately not applied** — a DC offset on the
+  stress axis cannot change a slope; it is absorbed by the toe correction, and
+  is printed only as a check on the sync channel's zero. Forcing the fit
+  through the origin instead (`regress0` in the sensitivity sweep) is both
+  biased high and noisier, because `load_raw` carries a tare offset.
+
+  The two clocks are anchored peak-to-peak and the residual lag refined by
+  cross-correlation. **`LAG_SEARCH_FRAC` must stay generous (0.25).** At ±5 %
+  of test duration the search rails against its own limit on 3 of 35 coupons
+  (true lags −12.3, −6.0, −5.5 s) and returns a scale 5–17 % wrong while R²
+  stays at 0.996–0.997 — so an R²-only guard passes it. A railed optimum is
+  detected explicitly and falls back to the peak ratio rather than being used.
+- **Checks DIC coverage** (`DIC_COVERAGE_MIN = 0.98`): the largest MTS force
+  the DIC record actually spans, as a fraction of the MTS peak. Below that, the
+  sync CSV stopped before the specimen did — see the warning at the top of this
+  README for the three P01 coupons this catches. Recorded per coupon in the
+  workbook.
+- Truncates each record: marks pre-load slack and post-fracture rebound (first
+  post-UTS frame where load < 50% of peak) as outside the analysis window
+  (`kept = False`) rather than dropping rows. The window **starts on the rising
+  edge** — the last sample *below* 2 % of peak before the peak — not the first
+  sample above it, which triggers on pre-touchdown baseline noise. On P01 this
+  moves the start from frame 0–12 to frame 41–84, i.e. the old rule was keeping
+  40–80 frames of pre-touchdown noise, some of it landing inside the modulus
+  fit window. `FlexuralDIC_Level2.truncation_mask` already worked this way;
+  the two now agree, as does `TensileDIC_Level2_tmp.py`'s copy.
 - **Smoothing is optional and off by default** (`APPLY_SMOOTHING = False`)
   — ASTM D638 doesn't call for filtering the stress-strain record, and the
   modulus/UTS/yield windows sit well clear of where the raw signal is
@@ -230,9 +326,32 @@ plotting here (see Level 3).
     right at a sharp peak — median is the safer default if you turn
     smoothing on.
 - Computes, from this truncated (and, if enabled, smoothed) signal:
-  - **Modulus E** (D638 §11.4) — slope of the linear region (0.05–0.3% strain).
-  - **Toe compensation** (D638 Annex A1) — shifts strain origin using the
-    modulus line's x-intercept.
+  - **Modulus E** (D638 §11.4) — slope of the linear region (0.05–0.3% strain),
+    and **toe compensation** (D638 Annex A1) in the same step, because the two
+    are not separable: the fit window is defined in *toe-corrected* strain but
+    the correction is what the fit produces, so `fit_modulus` iterates (fit,
+    shift the origin, re-select the window, refit). This is
+    `FlexuralDIC_Level2.fit_modulus` — the two pipelines now compute a modulus
+    the same way.
+
+    The old code selected the window on *raw* strain and subtracted the toe
+    afterwards, which contradicted the comment on `MODULUS_STRAIN_RANGE`
+    ("without including the toe") and made the toe correction a mathematical
+    no-op for E — subtracting a constant from the abscissa after the window is
+    fixed shifts the origin without changing the slope. Confirmed empirically:
+    an uncorrected E and the old "toe-corrected" E agree to the last digit on
+    all 35 coupons. **The numerical effect of fixing it is small**: measured
+    toe offsets are 1e-5 to 1e-4 strain, an order of magnitude below the
+    window's 5e-4 floor, so iterating moves mean E by 0.16 %. The exception is
+    `P01-TCL45-01` (toe 1.1e-3). Fixed for correctness, not for the number.
+  - **Chord modulus** — secant across `CHORD_STRAIN_RANGE` (0.10–0.30 % strain),
+    reported alongside the tangent value the way `FlexuralDIC_Level2` reports
+    `Ef_*_chord_GPa`. Not a D638 requirement; it is here because the sensitivity
+    sweep (below) shows the tangent modulus is not a stable quantity on this
+    material. Its window is deliberately *not* `MODULUS_STRAIN_RANGE` — see the
+    `LOAD_START_FRAC` warning in that section. It returns NaN rather than
+    extrapolating when the record doesn't reach both endpoints, and Level 2
+    prints the strain span it did reach.
   - **UTS** (D638 §11.2) — max stress on original area.
   - **0.2% offset yield** (D638 §A2.6).
   - **Poisson's ratio** (D638 §A3.10.1.3) — chord at εₐ = 0.002 over
@@ -258,8 +377,11 @@ plotting here (see Level 3).
   `kept` is `False`. Scalar properties are *not* repeated here — they live
   once per coupon in `FSR-SpecimenTesting.xlsx` (see below).
 - `FSR-SpecimenTesting.xlsx` (`SPECIMEN_SHEET`) — each coupon's scalar
-  properties (E, toe strain, yield stress/strain, UTS, strain at UTS,
-  Poisson's ratio) are written into new columns on that coupon's existing
+  properties (E tangent and chord, toe strain, modulus fit points, yield
+  stress/strain, UTS, strain at UTS, Poisson's ratio, plus the load-scale
+  provenance — `Load Scale (N/unit)`, `Load Scale R2`, `DIC Load Coverage`, so
+  a suspect stress axis is visible in the workbook and not only in a console
+  log) are written into new columns on that coupon's existing
   row, matched by Specimen ID. Only those columns are touched — other
   rows, formulas, and formatting in the workbook are left alone. If the
   file is open elsewhere when Level 2 runs, this step is skipped with a
@@ -319,8 +441,25 @@ step of its own.
   (stdout) and the `P01_MechanicalStats.xlsx` export.
 - `DIC_EXCLUDE` — coupon IDs to drop from the group plots and stat tables
   only (per-coupon plots still include them). Currently `P01-TCL45-01`,
-  excluded for an anomalously large toe correction (see the `TODO` next to
-  it) pending backup DIC data.
+  excluded for what the `TODO` beside it calls an anomalously large toe
+  correction, pending backup DIC data.
+
+  **That diagnosis was wrong, and the real one is worse.** The 2026-08-29
+  sensitivity run found that this coupon's DIC record covers only 90.6 % of the
+  MTS peak force — the sync CSV stopped before the specimen failed. Its
+  peak-anchored stress axis was inflated ~10 %, which is where the large toe
+  came from. Level 2's regressed scale fixes its *modulus* (−10.8 %), but its
+  **UTS and strain-at-UTS are still not the specimen's**, and no amount of
+  reprocessing recovers them from this recording. `P01-TSW00-01` (96.3 %) and
+  `P01-TSW00-02` (97.2 %) have the same problem more mildly and are **not**
+  currently excluded.
+
+  Recommendation: keep `P01-TCL45-01` out of UTS and strain-at-UTS statistics
+  and consider excluding the other two from those as well; its modulus is now
+  usable. Backup DIC data would only help if it is a *longer* recording — a
+  re-export of the same frames will not change the coverage. `DIC_EXCLUDE` is
+  all-or-nothing per coupon, so splitting modulus from UTS means either
+  splitting that switch or noting the caveat in the write-up.
 
 **What it does**
 - Per-coupon: draws each coupon's toe-corrected σ-ε curve (truncated at
@@ -499,7 +638,7 @@ residual would be a loud signal that the two files are not the same test.
 the approach travel — the loading nose hanging on an un-tared cell. It shows on
 all 12 flexural specimens in both orientations, and left in it inflates flexural
 strength ~1.6×. `find_force_baseline()` detects and removes it (ported from
-`mts_quick_plots.py`). Tensile and bearing records don't have it.
+`mts_plots.py`). Tensile and bearing records don't have it.
 
 **ROI orientation check — three coupons are blocked on it.** Every reduction in
 this script assumes the VIC-3D world frame is oriented the same way on every
@@ -715,17 +854,195 @@ MTS ramp slopes and the tensile workbook give for that orientation.
 
 ---
 
+## Result — how much of the tensile modulus scatter is processing?
+
+`tensile_modulus_sensitivity.py` turns every knob in the Level-2 reduction, one
+at a time and then all together, and recomputes E for each setting: 810
+settings × 35 coupons. It is **read-only on the pipeline** — it writes only to
+`<ROOT>/figs/sensitivity/` and never touches `FSR-SpecimenTesting.xlsx` or any
+Level-1/2 output. Run it whenever a processing choice is in dispute; it turns
+the argument into a number.
+
+E is a *slope*, and that alone decides which factors can matter. A scale error
+on the stress axis multiplies E directly. A DC offset on the stress axis cannot
+touch it — that is absorbed by the toe correction. Smoothing a nearly-straight
+segment is nearly the identity. The sweep confirms all three.
+
+### Ranked: how far E moves when each factor alone is flipped
+
+| factor | max \|ΔE\| | median | p90 |
+|---|---|---|---|
+| **window** — modulus fit window | 12.28 % | 2.73 % | 6.52 % |
+| **scale** — how `load_raw` becomes N | 9.37 % | 2.86 % | 7.14 % |
+| **toe** — Annex A1 handling | 7.07 % | 0.00 % | 2.58 % |
+| **trunc** — where the window starts | 5.99 % | 0.00 % | 2.63 % |
+| **smooth** — none / median / butter | 5.66 % | 0.77 % | 2.56 % |
+| **area_fac** — ±2 % on A₀ | 2.04 % | 2.00 % | 2.04 % |
+
+`area_fac` returning exactly ∓2 % for a ±2 % perturbation is the harness
+checking itself: E ∝ 1/A₀ exactly, so anything else would mean a bug in the
+sweep. Set `AREA_PERTURBATIONS` from your own caliper repeat spread and that row
+becomes your measurement uncertainty, on the same figure and at the same scale
+as the processing choices.
+
+### Four things it settled
+
+**1. The load scale was a real first-order error, and it is fixed.** CV across
+coupons 2.55 % → 0.71 % (details in Level 2 above). Worth doing on its own
+terms: a hardware constant should not vary 13 % coupon to coupon.
+
+**2. Three coupons have truncated DIC records.** The finding with the largest
+consequences, and the one nothing in the pipeline previously looked for — see
+the warning at the top of this README. `P01-TCL45-01` is anomalous because its
+DIC record covers 90.6 % of the test, **not** because of its toe correction.
+The TODO beside `DIC_EXCLUDE` in `TensileDIC_Level3.py` now has an answer, and
+it is not the one it expected: the regressed scale fixes that coupon's modulus
+(−10.8 %), but its UTS and strain-at-UTS remain unrecoverable from this
+recording, so it should stay out of any group statistic involving them.
+
+**3. The toe fix was a correctness fix, not a numerical one.** 0.16 % on mean
+E. See Level 2 above.
+
+**4. The recommended settings do NOT reduce the group CV.** Mean within-group
+CV% of E goes **3.83 → 3.87** — it does not improve. This is the opposite of
+what such an exercise is usually set up to show, and it is reported here
+because it is what the data says. The processing choices being argued over are
+not what drives the coupon-to-coupon scatter. They are still the right choices
+— a per-coupon scale error of up to 10 % is wrong whether or not it happens to
+cancel in a CV over three replicates — but **they are not a scatter fix and
+should not be presented as one.**
+
+### What actually drives the scatter: there is no linear region
+
+| | |
+|---|---|
+| E spread across the five-window grid | median **7.7 %** per coupon, max 21.8 % |
+| modulus fit R² | median **0.879**, min 0.808 (worst on 45°/90°) |
+| tangent (0.05–0.30 %) vs chord (0.10–0.30 %) | median **+6.1 %**, max 33.6 % |
+| within-group CV of E, for comparison | **3.9 %** |
+
+A quantity that moves more when you change the fit window than when you change
+which coupon you measured is not a tangent modulus. This is why Level 2 now
+writes `E_chord_GPa` next to `E_GPa` — but **the chord is a cross-check, not a
+replacement**, and it would be wrong to report it as the better number. A chord
+is read from two interpolated points, so where the tangent averages strain
+noise over ~60 points the chord takes it at face value. Measured, by direction:
+
+| | E tangent (GPa) | E chord (GPa) | UTS (MPa) |
+|---|---|---|---|
+| 00° | 6.931 ± 0.124 | 6.321 ± **0.477** | 76.30 ± 2.25 |
+| 45° | 3.187 ± 0.153 | 3.081 ± **0.338** | 48.18 ± 2.10 |
+| 90° | 3.437 ± 0.207 | 3.301 ± **0.299** | 39.65 ± 1.83 |
+
+The chord's standard deviation is 1.4–3.8× the tangent's. It is more
+*transparent* — "the average stiffness between these two strains" survives
+being asked what window you used — but it is a noisier estimate.
+
+**Recommendation**, in order:
+
+1. **Whatever you report, state the window.** This is the whole finding.
+2. **Quote the window sensitivity as the error bar on E** — ~8 % median, not
+   the 3.9 % within-group CV, which understates it by a factor of two. That is
+   the honest uncertainty on a modulus from this data.
+3. **Use the tangent/chord pair as a straightness test**, the way
+   `FlexuralDIC_Level2` does. Agreement means the segment really is straight;
+   the 5 % median (14 % max) disagreement here means it is not.
+4. **Don't switch windows hoping to fix it.** The code's
+   `MODULUS_STRAIN_RANGE = (0.0005, 0.003)` and `solid_mechanics_core.pdf`
+   §8.1's 0.05–0.25 % disagree, and that has been left alone deliberately: the
+   sweep shows *every* window in the grid is equally arbitrary on this
+   material. Switching improves nothing.
+5. **The real fix is less strain noise** — see the next section.
+
+⚠ **`LOAD_START_FRAC` and `MODULUS_STRAIN_RANGE` are inconsistent, and this is
+an open decision.** The analysis window starts at the last frame *below* 2 % of
+peak load, and the next frame — the first one kept — can already be well past
+it: at 10 Hz on a ~50 s ramp one frame is ~2 % of the ramp, so the first kept
+frame lands anywhere between 2 % and 8.5 % of peak depending on phase. On **18
+of the 35 P01 coupons** that puts the lowest available corrected strain between
+5.6e-4 and 9.5e-4 — *above* the modulus window's 5e-4 floor. The tangent fit
+tolerates it (it uses whatever points fall inside the window, which is itself a
+per-coupon window inconsistency of exactly the kind the toe fix removed); a
+chord cannot, so `CHORD_STRAIN_RANGE` is `(0.001, 0.003)` — 1e-3 being the
+lowest round floor every coupon actually reaches. Either lower
+`LOAD_START_FRAC` or raise the modulus window's floor to make the two agree;
+`chord_modulus` refuses rather than extrapolating, so this fails loudly instead
+of silently.
+
+### The next thing to measure, not yet done
+
+A low R² on a σ-ε line means noise on the **strain** axis — which also biases a
+least-squares slope *downward* (errors-in-variables attenuation), so it is not
+only scatter. `DO_GAUGE_SWEEP = True` re-derives axial strain from the
+per-frame full-field CSVs at several gauge lengths by both the two-point method
+Level 1 uses and a least-squares fit of `V` against `Y` over the whole ROI. The
+field fit is ~√N quieter and its R² says whether strain was uniform across the
+gauge — which for the 45° coupons is the measurement, not a diagnostic.
+(`FlexuralDIC_Level1` already works this way, fitting `exx` against Y for κ.)
+
+It is off by default because it re-reads every per-frame CSV (17–20 k rows
+each, on a network share). It has not been run. Replacing the extensometer
+changes what the strain channel *is*, not how well it is computed, so it wants
+the noise-floor numbers in hand before it is made.
+
+### Outputs — `<ROOT>/figs/sensitivity/`
+
+| file | what |
+|---|---|
+| `modulus_sensitivity_full.csv` | every combination, one row each |
+| `modulus_sensitivity_oat.csv` | one-factor-at-a-time deltas (the tornado data) |
+| `modulus_sensitivity_groups.csv` | CV% of E by exposure × direction, old vs new |
+| `scale_check.csv` | peak vs regressed scale per coupon, with R², intercept, lag, DIC coverage |
+| `window_check.csv` | E vs fit window, tangent vs chord, fit R² |
+| `tornado_<coupon>.png` | per-coupon tornado |
+| `window_sensitivity.png` | E vs fit window, all coupons |
+| `gauge_sensitivity.png` | E vs gauge length (only if `DO_GAUGE_SWEEP`) |
+
+Full per-change detail — including what in the original review was checked and
+*not* applied, and why — is in `CHANGELOG_tensile_2026-08-29.md`.
+
+---
+
 ## Outside the pipelines
 
-`mts_quick_plots.py` is a standalone first-look script — MTS channels only, no
-DIC, no property extraction. It plots force–displacement and stress–strain for
-all three test types (one figure each, colour by exposure, linestyle by
-orientation) straight from the raw `.txt` files plus the geometry columns in
-`FSR-SpecimenTesting.xlsx`. Use it to eyeball a batch; use the levelled
-pipelines for anything quotable. It is where the flexural load-cell tare was first
-documented, and it detects and removes the tare itself (`find_force_baseline`,
-with `--keep-tare` to disable). Its notes still describe the 8.00 in span as an
-assumption — that is now confirmed.
+`mts_plots.py` (renamed from `mts_quick_plots.py`) is a standalone first-look
+script — MTS channels only, no DIC, no property extraction. It plots
+force–displacement and stress–strain for all three test types (one figure each,
+colour by exposure, linestyle by orientation) straight from the raw `.txt` files
+plus the geometry columns in the specimen sheet. Use it to eyeball a batch; use
+the levelled pipelines for anything quotable.
+
+- **Geometry input** — it reads `FSR-SpecimenTesting.csv`, the CSV export kept
+  alongside `FSR-SpecimenTesting.xlsx` under the same stem, and falls back to
+  the `.xlsx` if the CSV is missing or unreadable. The CSV needs no Excel engine
+  and is not locked while the workbook is open. It is a Windows export, so it is
+  cp1252, not UTF-8 — the reader tries `utf-8-sig`, `cp1252`, `latin-1` in turn.
+- **ASTM reductions** — every formula it applies is written out in full, with
+  its source, in the `ASTM EQUATIONS` block at the top of the file: D638 §11.2
+  σ = P/A₀ and Annex A1 toe compensation; D790 §12.2 Eq.3 σ_f = 3PL/2bd²,
+  §12.3 Eq.4 ε_f = 6Dd/L², and the §12.3 large-support-span stress correction
+  (`--large-deflection`, off by default — this fixture is 16:1 and D/L peaks at
+  0.067, below the 0.10 threshold, and it prints max D/L on every run);
+  D953 §13.2 σ_b = P/(D·t) on the projected area with the §13.3 4 % hole
+  deformation ordinate drawn on the panel.
+- **Toe compensation** follows D638 Annex A1.3 literally — the *steepest*
+  straight segment of the load–deflection record, searched between 5 % and 60 %
+  of peak load, extrapolated to zero load. That agrees with the fixed 10–40 %
+  window it used before to within 0.02–0.12 mm on every P01 coupon.
+- **The tensile right-hand axis is not a D638 strain** and is labelled as such.
+  D638 §3.2.5 nominal strain is referred to the original *grip separation*,
+  which was never recorded for this batch, so crosshead travel is divided by the
+  DIC axial gauge length (4.36 in) instead, purely so the axis is on the same
+  scale as the DIC record. Fill in `TENSILE_GRIP_SEPARATION_MM` if it is ever
+  measured and the panel becomes a true D638 nominal strain.
+- It is where the flexural load-cell tare was first documented, and it detects
+  and removes the tare itself (`find_force_baseline`, with `--keep-tare` to
+  disable). Tare removal runs *before* the toe fit, since a constant offset
+  moves the Hookean line's zero-load intercept.
+- Outputs are `figs/mts_tensile.png`, `figs/mts_flexural.png`,
+  `figs/mts_bearing.png` (was `mts_quick_*.png`), plus a per-specimen stdout
+  table carrying the ASTM validity flags: D790 §12.2's 5 % strain rule, D790
+  §12.3's D/L threshold, and D953 §13.3's 4 % deformation.
 
 `matlab/tensile_plots.m` and `matlab/bearing_plots.m` are an independent MATLAB
 re-implementation of part of tensile Level 3's plotting, kept for reference;
@@ -733,16 +1050,65 @@ they are not run as part of either pipeline and aren't guaranteed to stay in
 sync.
 
 ---
+## ⚠ Specimen geometry comes from the CSV, not the workbook
+
+`Width / Dia. (in)` and `Computed Area (in²)` in `FSR-SpecimenTesting.xlsx` are
+**formula** columns:
+
+```text
+=IF(C2="Tensile",1.5,IF(C2="Bearing",0.5625,IF(C2="Flexural",1,"")))
+```
+
+openpyxl does not evaluate formulas. Every time a Level 2 writes its scalars
+back into the workbook it saves the formula and **drops the cached value**.
+`write_specimen_sheet` sets `wb.calculation.fullCalcOnLoad = True` to ask for a
+recalculation — but only *Excel* honours that flag. `pandas.read_excel` and
+openpyxl both read the cache, so those columns come back **blank** until
+somebody opens the workbook by hand and saves it.
+
+That is a read/write cycle between the two levels quietly poisoning the
+geometry Level 1 depends on. When it bites, the failure is silent and
+misleading: Level 1 computes `area = thickness × NaN`, writes `area_mm2 = NaN`
+to `coupon_scalars.csv`, and Level 2 reports **`insufficient data` for every
+coupon** — because the whole stress axis is NaN and `compute_properties` never
+gets 10 finite points.
+
+**Both Level 1 scripts therefore read `FSR-SpecimenTesting.csv`** — the export
+kept alongside the workbook under the same stem — and fall back to the `.xlsx`
+only if the CSV is missing or unreadable. The CSV holds evaluated values, needs
+no Excel engine, and is not locked while the workbook is open. It is a Windows
+export, so it is cp1252, not UTF-8; all three readers try `utf-8-sig`,
+`cp1252`, `latin-1` in turn. `mts_plots.py` already worked this way; the same
+reader now lives in `TensileDIC_Level1.py` and `FlexuralDIC_Level1.py`,
+duplicated rather than imported so each stays runnable alone (the convention
+`FLEX_SPAN_MM` already follows).
+
+Both now **refuse** rather than proceeding with NaN geometry, naming the cause
+and the fix, and Level 1 prints which source it read.
+
+**If you edit geometry in Excel, re-export the CSV.** It is the source of truth
+for the pipeline now; the workbook is the source of truth for you. Any Level-2
+run re-strips the workbook's formula caches, so the `.xlsx` fallback should not
+be relied on.
+
+Unaffected: `TensileDIC_Level3.py` reads only plain-value columns (thickness,
+and the scalars Level 2 wrote), and `TensileDIC_Level2_tmp.py` takes area from
+`coupon_scalars.csv`.
+
+---
+
 ## Common configuration
 
 All scripts share a `SWITCHES` block at the top (`PRINTS`, `EXPOSURES`,
 `DIRECTIONS`, `REPLICATES`) used to select which coupons to process, and
 a `PATHS` block — trimmed to only what each script actually touches.
-`TensileDIC_Level2.py` and `TensileDIC_Level3.py` don't need the raw-data `DATA_ROOTS`
-at all, since by the time they run everything they need is already in
-`DIC_DIR` or the specimen sheet; `TensileDIC_Level2_tmp.py` is the exception —
-it needs both the raw DIC sync CSVs (`DATA_ROOTS`) and `MTS_DIR`, same as
-Level 1, because it re-derives force from the raw MTS record.
+`TensileDIC_Level3.py` doesn't need the raw-data `DATA_ROOTS` at all, since by
+the time it runs everything it needs is already in `DIC_DIR` or the specimen
+sheet. `TensileDIC_Level2.py` **now does** need `MTS_DIR` (it regresses the load
+scale against the raw MTS record) and `DATA_ROOTS` (as a fallback clock source,
+for per-coupon CSVs written before the `time_s` fix — see the sync-CSV warning
+near the top). `TensileDIC_Level2_tmp.py` and `tensile_modulus_sensitivity.py`
+need both for the same reasons.
 
 The flexural scripts follow the same shape. Their `EXPOSURES` is `{CL, IS}` and
 `DIRECTIONS` is `{00, 90}` — the other exposures and the 45° direction weren't

@@ -4,7 +4,7 @@ FlexuralDIC_Level2.py  —  FSR Flexural Coupons (ASTM D790, 3-point bend)
 =========================================================================
 Reads Level-1's per-coupon frame CSV, applies failure truncation, and computes
 ASTM D790 flexural properties. No plotting here — Level 3 doesn't exist yet
-(see the README); plot from the per-coupon CSV and the workbook columns this
+(see the README); plot from the per-coupon CSV and the sheet columns this
 writes until it does.
 
 Standards compliance — what each calculation cites
@@ -79,21 +79,21 @@ OUTPUT per coupon
                                      eps_curvature, eps_deflection,
                                      eps_crosshead (all toe-corrected). All NaN
                                      where kept is False.
-  FSR-SpecimenTesting.xlsx           the D790 scalars written into each coupon's
+  FSR-SpecimenTesting.csv            the D790 scalars written into each coupon's
                                      row, under the SPECIMEN_SHEET_COLUMNS
                                      headers below.
   <DIC_DIR>/level2_group_stats.csv   mean/std/count per exposure × direction,
                                      under a 'test' index level of "flexural".
 
-THE WORKBOOK IS THE SOURCE OF TRUTH, LIKE IT IS FOR TENSILE
-------------------------------------------------------------
+THE SPECIMEN SHEET IS THE SOURCE OF TRUTH, LIKE IT IS FOR TENSILE
+-----------------------------------------------------------------
 This used to write flexural_properties.csv and flexural_group_stats.csv, and
 this docstring used to record that whether the D790 scalars belonged in
-FSR-SpecimenTesting.xlsx was undecided. It is decided: they go in the workbook,
-under flexural-specific column headers, exactly as TensileDIC_Level2 writes the
-D638 scalars into the same sheet. Tensile and flexural coupons are different
-rows of that sheet, so the two never collide, and there is now one place to read
-any coupon's properties from.
+FSR-SpecimenTesting was undecided. It is decided: they go in the specimen
+sheet, under flexural-specific column headers, exactly as TensileDIC_Level2
+writes the D638 scalars into the same sheet. Tensile and flexural coupons are
+different rows of that sheet, so the two never collide, and there is now one
+place to read any coupon's properties from.
 
 Group statistics go into level2_group_stats.csv, the file TensileDIC_Level2
 writes, under an added 'test' index level. That level is load-bearing, not
@@ -104,13 +104,13 @@ only its own test's rows and leaves the other's alone.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import openpyxl
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -122,10 +122,25 @@ DIC_DIR = Path(
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\DIC"
 )
-SPECIMEN_SHEET = Path(
+# Specimen sheet. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# "Width / Dia. (in)" and "Computed Area (in²)" used to be FORMULA cells in
+# FSR-SpecimenTesting.xlsx, and openpyxl does not evaluate formulas: every time
+# a Level 2 saved its scalars back into the workbook it wrote the formula and
+# dropped the cached value, so Level 1 read those columns back as blank, wrote
+# area_mm2 = NaN, and Level 2 then reported "insufficient data" for every
+# coupon. The workbook is retired. FSR-SpecimenTesting.csv holds evaluated
+# values, needs no Excel engine, is not locked while something else has it
+# open, and is what every script in this folder now both reads and writes.
+SPECIMEN_CSV = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.csv"
 )
+
+# The CSV started life as a Windows Excel export, so its superscript characters
+# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
+# order; write_specimen_sheet re-writes the file as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # =============================================================================
 # SWITCHES
@@ -146,8 +161,8 @@ IN2MM        = 25.4
 FLEX_SPAN_MM = 8.00 * IN2MM
 
 # =============================================================================
-# Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
-# ("Specimen ID") — maps the property dict key to the Excel column header.
+# Scalar property columns written into SPECIMEN_CSV, keyed by coupon
+# ("Specimen ID") — maps the property dict key to the sheet column header.
 #
 # Every header is prefixed "Flex " so nothing here can be confused with the
 # tensile columns TensileDIC_Level2 writes into the same sheet. The two test
@@ -246,68 +261,89 @@ def load_coupon_scalars() -> pd.DataFrame:
     return pd.read_csv(fp).set_index("coupon")
 
 
+def read_specimen_csv() -> pd.DataFrame:
+    """The specimen sheet as raw text — every cell a string, nothing coerced.
+
+    dtype=str with keep_default_na=False is what makes the file safe to write
+    back: cells this script does not touch round-trip character for character,
+    so a Level-2 run cannot reformat a hand-entered geometry value or turn an
+    all-integer column into floats on its way through pandas.
+    """
+    for enc in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(SPECIMEN_CSV, encoding=enc,
+                               dtype=str, keep_default_na=False)
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"{SPECIMEN_CSV.name}: not decodable as "
+                       f"{'/'.join(CSV_ENCODINGS)}")
+
+def _cell(v) -> str:
+    """One specimen-sheet cell as text. Missing or non-finite writes blank, so
+    a property that could not be computed clears the cell instead of leaving
+    the previous run's value standing.
+
+    Same routine as TensileDIC_Level2._cell, plus the bool branch that
+    broke_before_5pct needs: np.isfinite would reject a bool outright.
+    """
+    if isinstance(v, (bool, np.bool_)):
+        return "TRUE" if v else "FALSE"   # what Excel reads back as a boolean
+    if v is None:
+        return ""
+    v = float(v)
+    return "" if not np.isfinite(v) else f"{v:.12g}"
+
 def write_specimen_sheet(rows: list[dict]) -> None:
-    """Write each coupon's D790 scalars into its row in SPECIMEN_SHEET, matched
-    by Specimen ID. Adds any missing property columns at the end; everything
-    else in the workbook (other rows, formulas, formatting) is left untouched.
-    Skipped with a warning if the file can't be opened — e.g. open in Excel.
+    """Write each coupon's scalar properties into its row of SPECIMEN_CSV,
+    matched by Specimen ID. Adds any missing property columns at the end;
+    every other cell is written back exactly as it was read. Skipped with a
+    warning if the file can't be read or replaced — e.g. open in Excel.
 
     Same routine as TensileDIC_Level2.write_specimen_sheet, against the same
-    workbook but a disjoint set of rows and column headers.
+    file but a disjoint set of rows and column headers.
     """
     try:
-        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
+        df = read_specimen_csv()
     except FileNotFoundError:
-        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
+        print(f"[!] {SPECIMEN_CSV} not found — skipping specimen sheet update")
         return
-    ws = wb.active
+    except Exception as exc:
+        print(f"[!] {SPECIMEN_CSV.name}: {exc} — skipping specimen sheet update")
+        return
 
-    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
-    id_col = header.get("Specimen ID")
-    if id_col is None:
+    if "Specimen ID" not in df.columns:
         print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
         return
 
-    next_col = ws.max_column + 1
     for label in SPECIMEN_SHEET_COLUMNS.values():
-        if label not in header:
-            ws.cell(row=1, column=next_col, value=label)
-            header[label] = next_col
-            next_col += 1
-
-    row_by_id = {ws.cell(row=r, column=id_col).value: r
-                 for r in range(2, ws.max_row + 1)}
+        if label not in df.columns:
+            df[label] = ""
+    col_pos  = {c: j for j, c in enumerate(df.columns)}
+    row_by_id = {cid: i for i, cid in enumerate(df["Specimen ID"])}
 
     n_written = 0
     for row in rows:
-        r = row_by_id.get(row["coupon"])
-        if r is None:
+        i = row_by_id.get(row["coupon"])
+        if i is None:
             print(f"[!] {row['coupon']} has no row in the specimen sheet — "
                   f"its properties were not written")
             continue
         for key, label in SPECIMEN_SHEET_COLUMNS.items():
-            v = row.get(key)
-            # bools (broke_before_5pct) are written through as-is; np.isfinite
-            # would reject them, and None is how a blank cell is spelled.
-            if isinstance(v, (bool, np.bool_)):
-                v = bool(v)
-            elif v is None or not np.isfinite(v):
-                v = None
-            else:
-                v = float(v)
-            ws.cell(row=r, column=header[label], value=v)
+            df.iat[i, col_pos[label]] = _cell(row.get(key))
         n_written += 1
 
-    # openpyxl doesn't evaluate formulas, so re-saving drops the cached values
-    # of every formula cell in the workbook (e.g. Width/Dia, Computed Area)
-    # until something recalculates them. Force a full recalculation on next
-    # open so they never appear blank.
-    wb.calculation.fullCalcOnLoad = True
+    # Write alongside the target and rename over it. The specimen sheet is now
+    # the only copy of the hand-entered geometry, so a half-written file would
+    # be real data loss rather than just a failed run.
+    tmp = SPECIMEN_CSV.with_name(SPECIMEN_CSV.name + ".tmp")
     try:
-        wb.save(SPECIMEN_SHEET)
-        print(f"Specimen sheet: {n_written} coupon(s) → {SPECIMEN_SHEET.name}")
-    except PermissionError:
-        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        os.replace(tmp, SPECIMEN_CSV)
+        print(f"Specimen sheet: {n_written} coupon(s) → {SPECIMEN_CSV.name}")
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"[!] could not update {SPECIMEN_CSV.name} ({exc}) — "
+              f"properties were not saved")
 
 
 def read_existing_group_stats(fp: Path) -> pd.DataFrame | None:
@@ -627,7 +663,7 @@ def main() -> None:
         # tensile. D790 §12.9 asks for the same summary statistics.
         stats_fp = write_group_stats(rows)
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_CSV.name}, "
               f"DIC/{stats_fp.name}")
 
     print(f"\nDone. {time.time() - t0:.1f} s")

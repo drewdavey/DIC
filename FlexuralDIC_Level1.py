@@ -85,7 +85,7 @@ The flexural records open on a constant ~860 N held through the approach
 travel: the loading nose hanging on an un-tared cell. It shows on all 12
 flexural specimens in both orientations, and left in it inflates flexural
 strength ~1.6x. find_force_baseline() detects and removes it (ported from
-mts_quick_plots.py). Tensile and bearing records don't have it.
+mts_plots.py). Tensile and bearing records don't have it.
 
 SPAN
 ----
@@ -121,7 +121,7 @@ INPUT per coupon
   <coupon_dir>/*.out            VIC-3D full-field export, one per DIC frame
   <coupon_dir>/<folder>.csv     VIC sync CSV — read for its frame clock only
   <MTS_DIR>/<coupon_id>.txt     MTS raw: disp_mm, force_N, output_V, time_s
-  FSR-SpecimenTesting.xlsx      depth d and width b (read only, never written)
+  FSR-SpecimenTesting.csv       depth d and width b (read only, never written)
 
 OUTPUTS
   <coupon_dir>/<out_filename>.csv   Step A: one CSV per .out, written next to
@@ -170,16 +170,33 @@ MTS_DIR = Path(
 )
 DIC_DIR  = MTS_DIR.parent / "DIC"   # per-coupon CSVs land here, next to MTS/
 RAW_ROOT = DIC_DIR / "raw" / "2026_FSR_Flexural_FCL_FIS"
-SPECIMEN_SHEET = Path(
+# Specimen geometry. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# 'Width / Dia. (in)' used to be a FORMULA cell in FSR-SpecimenTesting.xlsx.
+# openpyxl does not evaluate formulas, so every time a Level 2 wrote its
+# scalars back into the workbook it saved the formula and dropped the cached
+# value; pandas and openpyxl both read the CACHE, so that column read blank
+# until somebody opened the workbook in Excel and saved it, and
+# specimen_geometry() then returned b_mm = NaN with every stress downstream
+# NaN too. So the workbook is retired. FSR-SpecimenTesting.csv holds evaluated
+# values, needs no Excel engine, and is not locked while something else has it
+# open — mts_plots.py and TensileDIC_Level1.py read it the same way, and the
+# Level 2s write their scalars back into it.
+SPECIMEN_STEM  = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting"
 )
+SPECIMEN_CSV   = SPECIMEN_STEM.with_suffix(".csv")
+
+# The CSV started life as a Windows Excel export, so it may still be cp1252
+# rather than UTF-8; the Level 2s re-write it as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # =============================================================================
 # SWITCHES — toggle which coupons to process
 # =============================================================================
 PRINTS     = ["P01"]
-EXPOSURES  = {"CL": True, "IS": True}      # only CL and IS were bend-tested
+EXPOSURES  = {"CL": True, "IS": False}      # only CL and IS were bend-tested
 DIRECTIONS = {"00": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
@@ -329,6 +346,34 @@ def load_mts_txt(fp: Path) -> pd.DataFrame:
               .apply(pd.to_numeric, errors="coerce")
               .dropna(subset=["force_N", "disp_mm"]))
 
+def _read_specimen_table() -> tuple[pd.DataFrame, Path]:
+    """Specimen sheet as (dataframe, path actually read).
+
+    See the SPECIMEN_CSV block near the top for why this reads a CSV and not a
+    workbook. Same reader TensileDIC_Level1 and mts_plots use; duplicated
+    rather than imported so each script stays runnable on its own, as
+    FLEX_SPAN_MM already is.
+    """
+    problems = []
+    if SPECIMEN_CSV.exists():
+        for enc in CSV_ENCODINGS:
+            try:
+                return pd.read_csv(SPECIMEN_CSV, encoding=enc), SPECIMEN_CSV
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:              # malformed CSV, locked file
+                problems.append(f"{SPECIMEN_CSV.name} [{enc}]: {exc}")
+                break
+        else:
+            problems.append(f"{SPECIMEN_CSV.name}: not decodable as "
+                            f"{'/'.join(CSV_ENCODINGS)}")
+    else:
+        problems.append(f"{SPECIMEN_CSV.name}: not found")
+
+    raise RuntimeError("Could not read the specimen sheet:\n  "
+                       + "\n  ".join(problems))
+
+
 def specimen_geometry(cid: str) -> tuple[float, float]:
     """Return (b, d) in mm: width and depth of the beam, from the specimen sheet.
 
@@ -336,14 +381,24 @@ def specimen_geometry(cid: str) -> tuple[float, float]:
     the sheet's Measured Gauge Thickness (0.50 in nominal) and 'width' b is
     Width / Dia. (1.00 in nominal).
     """
-    df = pd.read_excel(SPECIMEN_SHEET)
+    df, src = _read_specimen_table()
     t_col = next(c for c in df.columns if "thickness" in c.lower())
     w_col = next(c for c in df.columns if "width" in c.lower() and "dia" in c.lower())
     row = df.loc[df["Specimen ID"] == cid]
     if row.empty:
-        raise RuntimeError(f"{cid} not in {SPECIMEN_SHEET.name}")
+        raise RuntimeError(f"{cid} not in {src.name}")
     row = row.iloc[0]
-    return float(row[w_col]) * IN2MM, float(row[t_col]) * IN2MM
+    b_in = pd.to_numeric(row[w_col], errors="coerce")
+    d_in = pd.to_numeric(row[t_col], errors="coerce")
+    # Refuse rather than returning NaN: a NaN b or d makes every stress NaN
+    # further down with nothing saying why.
+    if not (np.isfinite(b_in) and np.isfinite(d_in)):
+        raise RuntimeError(
+            f"{cid}: missing geometry in {src.name} "
+            f"(b={row[w_col]!r}, d={row[t_col]!r}).\n"
+            f"    Fix: fill '{w_col}' and '{t_col}' in {SPECIMEN_CSV.name}. "
+            f"That file is a plain CSV — edit it directly.")
+    return float(b_in) * IN2MM, float(d_in) * IN2MM
 
 
 # =============================================================================
@@ -433,7 +488,7 @@ def find_break_frame(out_files: list[Path]) -> int:
 def find_force_baseline(d: np.ndarray, f: np.ndarray) -> float:
     """Level of the leading flat run in `f`, or 0.0 if there isn't one.
 
-    Same detector as mts_quick_plots.find_force_baseline. The flexural records
+    Same detector as mts_plots.find_force_baseline. The flexural records
     open on a constant ~862 +/- 3 N holding over ~1.6 mm of crosshead travel,
     against loading slopes of ~164 N/mm (0 deg) and ~85 N/mm (90 deg): force
     cannot stay constant while the crosshead advances, and the same level shows

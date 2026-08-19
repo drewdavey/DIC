@@ -15,9 +15,20 @@ DIC sync CSV's own load channel, used for batches where that channel is
 unreliable. It writes the same outputs as this script but leaves this
 file untouched.
 
+INPUT NOTE — the load scale
+  load_raw becomes force_N by regressing the raw MTS force against it over the
+  rising ramp (LOAD_SCALE_MODE = "regress"), not by the ratio of the two peak
+  samples the earlier versions of this script used. See LOAD_SCALE_MODE for the
+  measurement that motivated the change, and tensile_modulus_sensitivity.py for
+  the full sweep. The old behaviour is still reachable with
+  LOAD_SCALE_MODE = "peak".
+
 Standards compliance — what each calculation cites
   Toe compensation     : D638 Annex A1 (mandatory unless toe is real material response)
   Modulus              : D638 §11.4   (slope of initial linear region of σ-ε)
+  Chord modulus        : not a D638 requirement — reported alongside the tangent
+                         value because the tangent is window-sensitive on this
+                         material (see chord_modulus)
   0.2 % offset yield    : D638 §A2.6 / Fig. A2.1 (offset from toe-corrected origin)
   Tensile strength UTS  : D638 §11.2   (max stress / original area)
   Poisson's ratio       : D638 Annex A3.10.1.3 (chord at ε_a=0.002 over 0.0005-0.0025)
@@ -47,15 +58,18 @@ OUTPUT per coupon
                                if APPLY_SMOOTHING is on), stress_MPa_unsmoothed,
                                strain_axial_unsmoothed (same window, pre-smoothing).
                                All L2 columns are NaN where kept is False.
-  FSR-SpecimenTesting.xlsx    scalar properties written into each coupon's
-                               row (E, toe strain, yield stress/strain, UTS,
-                               strain at UTS, Poisson's ratio) — the single
-                               source of truth for per-coupon scalars, read
-                               back out by Level-3.
+  FSR-SpecimenTesting.csv     scalar properties written into each coupon's
+                               row (E tangent and chord, toe strain, modulus
+                               fit points, yield stress/strain, UTS, strain at
+                               UTS, Poisson's ratio, plus the load-scale
+                               provenance: scale, its R², and the DIC coverage
+                               fraction) — the single source of truth for
+                               per-coupon scalars, read back out by Level-3.
   <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
 from __future__ import annotations
+import os
 import sys
 import time
 from pathlib import Path
@@ -63,7 +77,6 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import median_filter
 from scipy.signal import butter, filtfilt
-import openpyxl
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -75,10 +88,25 @@ DIC_DIR = Path(
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\DIC"
 )
-SPECIMEN_SHEET = Path(
+# Specimen sheet. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# "Width / Dia. (in)" and "Computed Area (in²)" used to be FORMULA cells in
+# FSR-SpecimenTesting.xlsx, and openpyxl does not evaluate formulas: every time
+# a Level 2 saved its scalars back into the workbook it wrote the formula and
+# dropped the cached value, so Level 1 read those columns back as blank, wrote
+# area_mm2 = NaN, and Level 2 then reported "insufficient data" for every
+# coupon. The workbook is retired. FSR-SpecimenTesting.csv holds evaluated
+# values, needs no Excel engine, is not locked while something else has it
+# open, and is what every script in this folder now both reads and writes.
+SPECIMEN_CSV = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.csv"
 )
+
+# The CSV started life as a Windows Excel export, so its superscript characters
+# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
+# order; write_specimen_sheet re-writes the file as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # =============================================================================
 # SWITCHES
@@ -101,11 +129,81 @@ LOAD_START_FRAC = 0.02     # pre-load: drop frames before load exceeds this × p
 LOAD_END_FRAC   = 0.50     # post-fracture: cut first post-UTS frame where load < this × peak
 
 # Scale factor applied to load_raw to produce force_N (N per sync-CSV unit).
-# Two modes — the first one found is used:
-#   1. Per-coupon  : mts_peak_N / max(raw load_raw)  — most accurate, always
-#                    available since Level-1 always writes a coupon_scalars.csv row
-#   2. Combined    : SCALE_N_PER_UNIT below          — fallback safety net
+#
+# LOAD_SCALE_MODE selects how it is found:
+#   "regress" (default) — least squares of the raw MTS force against load_raw
+#                over the rising ramp, using every point in it.
+#   "peak"     — the original rule: mts_peak_N / max(|load_raw|).
+#   Either falls back to the other, then to SCALE_N_PER_UNIT, rather than
+#   failing closed on a coupon whose MTS file is missing or unreadable.
+#
+# WHY THE DEFAULT CHANGED. The peak ratio sets the entire stress axis — and
+# therefore E, UTS and yield, all linearly — from the ratio of two single
+# samples: the largest of a few thousand noisy MTS samples over the largest of
+# a few thousand noisy sync samples, taken from two records that do not share a
+# clock. Both maxima are biased high by their own noise floors and there is no
+# reason the two biases match. It also assumes the DIC record contains the peak
+# at all, and on three P01 coupons it does not (see DIC_COVERAGE_MIN).
+#
+# The load cell and DAQ gain are hardware constants, so every coupon in a batch
+# should return the same scale. Measured across the 35 P01 tensile coupons:
+#
+#     peak ratio    mean 555.3  CV 2.55 %   range 540.0 – 613.8
+#     regressed     mean 559.4  CV 0.71 %   range 551.0 – 566.6
+#
+# — a 3.6x reduction in the scatter of a factor that multiplies E directly.
+# The regression also returns an R² as a free diagnostic on sync quality, which
+# a ratio of two numbers cannot.
+#
+# The fitted intercept is deliberately NOT applied. A DC offset on the stress
+# axis does not change a slope; it is absorbed by the toe correction. It is
+# printed only as a check on the sync channel's zero. (It does bias UTS and
+# yield, but those are anchored to the MTS peak by other means.)
+LOAD_SCALE_MODE = "regress"      # "regress" | "peak"
 SCALE_N_PER_UNIT: float = 555.5928
+
+MTS_DIR = DIC_DIR.parent / "MTS"   # raw MTS .txt, for the regressed load scale
+MTS_HEADERS = 8                    # header rows before row 1 of data
+
+# Raw VIC-3D project dirs, same mapping Level 1 and Level2_tmp use. Needed only
+# as a FALLBACK clock source: per-coupon CSVs written by a Level 1 older than
+# 2026-08-29 have a flattened time_s (an absolute epoch rounded to 6
+# significant figures — every row identical), which cannot anchor anything.
+# When that is detected, the full-precision Time_0_0 is re-read from the sync
+# CSV here, so Level 2 works on existing files without a full Level-1 re-run.
+DATA_ROOTS = {
+    "CL": DIC_DIR / "raw" / "2026_FSR_TensileTest_TCL",
+    "SW": DIC_DIR / "raw" / "2026_FSR_TensileTest_TSW_TIS_TUV",
+    "UV": DIC_DIR / "raw" / "2026_FSR_TensileTest_TSW_TIS_TUV",
+    "IS": DIC_DIR / "raw" / "2026_FSR_TensileTest_TSW_TIS_TUV",
+}
+
+# Band of the ramp used for the regressed scale, as a fraction of peak force.
+# Bounded below to stay off the noise floor and above to stay out of the
+# roll-over near peak, where any residual clock drift shows up as curvature.
+SCALE_FIT_BAND = (0.10, 0.85)
+
+# The two records don't share a clock, so they are anchored peak-to-peak and
+# the residual lag is refined by cross-correlation over ±LAG_SEARCH_FRAC of the
+# test duration.
+#
+# LAG_SEARCH_FRAC MUST BE GENEROUS. At 0.05 the search rails against its own
+# limit on 3 of 35 P01 coupons (TCL45-01, TSW00-01, TSW00-02 — true lags of
+# −12.3, −6.0 and −5.5 s) and returns a scale 5–17 % wrong while R² stays above
+# 0.996, so the R² guard does not catch it. At 0.25 every P01 coupon converges
+# with the optimum in the interior. A railed optimum is reported and rejected.
+LAG_SEARCH_FRAC = 0.25
+LAG_SEARCH_STEPS = 1001
+
+SCALE_R2_MIN = 0.98        # below this, warn: sync/MTS agreement is poor
+
+# Fraction of the MTS peak force the DIC record must actually reach. The sync
+# CSV can stop before the specimen fails, and then max(|load_raw|) is not the
+# peak at all and the peak-ratio scale is inflated by however much of the ramp
+# was missed. On P01: TCL45-01 reaches 90.6 %, TSW00-01 96.3 %, TSW00-02
+# 97.2 %; every other coupon is above 99.8 %. TCL45-01 is the coupon Level 3
+# excludes for an "anomalous toe" — its stress axis is simply 10 % too high.
+DIC_COVERAGE_MIN = 0.98
 
 # =============================================================================
 # PROPERTY SETTINGS
@@ -117,6 +215,27 @@ SCALE_N_PER_UNIT: float = 555.5928
 # generated plot doesn't sit on the linear segment.
 MODULUS_STRAIN_RANGE = (0.0005, 0.003)
 
+# Window for the chord modulus. DELIBERATELY NOT MODULUS_STRAIN_RANGE.
+#
+# The truncated record does not always reach down to 5e-4 corrected strain. The
+# analysis window starts at the last frame below LOAD_START_FRAC x peak, and the
+# NEXT frame — the first one kept — can already be well past that threshold: at
+# 10 Hz on a ~50 s ramp one frame is ~2 % of the ramp, so the first kept frame
+# lands anywhere between 2 % and 8.5 % of peak load depending on phase. On 18 of
+# the 35 P01 coupons that puts the lowest available corrected strain between
+# 5.6e-4 and 9.5e-4, i.e. ABOVE the modulus window's floor.
+#
+# The tangent fit tolerates this (it uses whatever points fall inside the
+# window) but a chord cannot: it is defined by its two endpoints, so an
+# unavailable endpoint has to be either extrapolated or refused. chord_modulus
+# refuses — np.interp would otherwise clamp at the end of the data and return a
+# confident-looking number computed from the wrong point.
+#
+# 1e-3 is the lowest round floor every P01 coupon actually reaches (worst case
+# 9.47e-4). Widen MODULUS_STRAIN_RANGE's floor or lower LOAD_START_FRAC and
+# this can come back down; see the README for that open decision.
+CHORD_STRAIN_RANGE = (0.001, 0.003)
+
 # D638 §A2.6 — 0.2% offset yield strength
 YIELD_OFFSET = 0.002
 
@@ -125,13 +244,18 @@ YIELD_OFFSET = 0.002
 POISSON_RANGE = (0.0005, 0.0025)
 POISSON_CHORD_AT = 0.002
 
-# Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
-# ("Specimen ID") — maps the property dict key to the Excel column header.
+# Scalar property columns written into SPECIMEN_CSV, keyed by coupon
+# ("Specimen ID") — maps the property dict key to the sheet column header.
 # Level-3 reads these same headers back out (per-coupon plots, group plots,
-# and the printed/exported stat tables all read from this one workbook).
+# and the printed/exported stat tables all read from this one file).
 SPECIMEN_SHEET_COLUMNS = {
     "E_GPa":         "E (GPa)",
+    "E_chord_GPa":   "E chord (GPa)",
     "eps_toe":       "Toe Strain",
+    "n_fit":         "Modulus Fit Points",
+    "scale_N_per_unit": "Load Scale (N/unit)",
+    "scale_r2":      "Load Scale R2",
+    "dic_coverage":  "DIC Load Coverage",
     "sigma_y_MPa":   "Yield Stress (MPa)",
     "eps_y":         "Yield Strain",
     "UTS_MPa":       "UTS (MPa)",
@@ -185,6 +309,151 @@ def load_coupon_scalars() -> pd.DataFrame:
         return pd.DataFrame(columns=["mts_peak_N", "area_mm2"])
     return pd.read_csv(fp).set_index("coupon")
 
+def frame_clock(cid: str, df: pd.DataFrame) -> np.ndarray | None:
+    """Elapsed seconds per DIC frame, or None if no usable clock exists.
+
+    Prefers the per-coupon CSV's own time_s. Falls back to re-reading
+    Time_0_0 from the raw sync CSV when that column is degenerate — which it is
+    on every file written by a Level 1 older than 2026-08-29, where an absolute
+    Unix epoch was pushed through float_format="%.6g" and came out as one
+    repeated constant. A clock with fewer than two distinct values cannot place
+    a frame in time, so it is rejected outright rather than silently producing a
+    flat interpolation.
+    """
+    if "time_s" in df:
+        t = pd.to_numeric(df["time_s"], errors="coerce").to_numpy(dtype=float)
+        finite = t[np.isfinite(t)]
+        if finite.size and np.unique(finite).size > 1:
+            return t - finite[0]
+
+    exposure, _ = parse_id(cid)
+    root = DATA_ROOTS.get(exposure)
+    if root is None:
+        return None
+    sync_fp = root / cid / f"{cid}.csv"
+    if not sync_fp.exists():
+        return None
+    try:
+        sync = pd.read_csv(sync_fp)
+    except Exception:
+        return None
+    col = next((c for c in sync.columns if "time" in c.lower()), None)
+    if col is None:
+        return None
+    t = pd.to_numeric(sync[col], errors="coerce").to_numpy(dtype=float)[:len(df)]
+    finite = t[np.isfinite(t)]
+    if not finite.size or np.unique(finite).size <= 1:
+        return None
+    t = t - finite[0]
+    if len(t) < len(df):                       # sync shorter than the record
+        t = np.concatenate([t, np.full(len(df) - len(t), np.nan)])
+    return t
+
+
+def read_mts(cid: str) -> pd.DataFrame | None:
+    """Raw MTS record for one coupon, or None. Columns are already mm/N/V/s.
+
+    Tab-separated with an 8-line header, same as Level 1's load_mts_txt — the
+    separator matters: r"\\s+" also splits on the decimal-aligned padding some
+    rows carry and silently shifts columns.
+    """
+    hits = sorted(MTS_DIR.glob(f"{cid}*.txt"))
+    if not hits:
+        return None
+    try:
+        return (pd.read_csv(hits[0], sep="\t", skiprows=MTS_HEADERS, header=None,
+                            names=["disp_mm", "force_N", "output_V", "time_s"],
+                            encoding="utf-8-sig", on_bad_lines="skip")
+                  .apply(pd.to_numeric, errors="coerce")
+                  .dropna(subset=["force_N"]))
+    except Exception:
+        return None
+
+
+def load_scale_for(cid, load_raw, df, mts_peak, raw_peak):
+    """Newtons per sync-CSV unit. Returns (scale, r2, coverage, note).
+
+    See LOAD_SCALE_MODE above for why the regression is preferred over the peak
+    ratio, and what it measured on P01.
+
+    `coverage` is the largest MTS force the DIC record actually spans, as a
+    fraction of the MTS peak. Below DIC_COVERAGE_MIN the sync CSV stopped
+    before the specimen did, max(|load_raw|) is not the peak, and any
+    peak-anchored scale for that coupon is inflated. It is NaN when the
+    regression could not run.
+
+    Falls back to the peak ratio, then to SCALE_N_PER_UNIT, so this can never
+    fail closed on a coupon whose MTS file is missing.
+    """
+    fallback = (mts_peak / raw_peak
+                if mts_peak is not None and raw_peak > 0 else SCALE_N_PER_UNIT)
+    if LOAD_SCALE_MODE == "peak":
+        return fallback, np.nan, np.nan, "peak ratio (LOAD_SCALE_MODE)"
+
+    mts = read_mts(cid)
+    if mts is None:
+        return fallback, np.nan, np.nan, "peak ratio (no MTS file)"
+    time_s = frame_clock(cid, df)
+    if time_s is None:
+        return fallback, np.nan, np.nan, "peak ratio (no usable frame clock)"
+
+    f, t = mts["force_N"].to_numpy(), mts["time_s"].to_numpy()
+    if not (np.isfinite(f).any() and np.isfinite(t).any()):
+        return fallback, np.nan, np.nan, "peak ratio (no usable MTS clock)"
+    t = t - t[np.isfinite(t)][0]
+
+    # Anchor the two clocks peak-to-peak, then refine the lag by correlation.
+    # The argmax is itself a single sample and the force curve is flat near
+    # peak, so on a noisy record it can land well off the true peak; it would be
+    # poor form to replace a single-sample scale and keep a single-sample time
+    # anchor. And when the DIC record is truncated (coverage below), the DIC
+    # "peak" is not the peak at all and the anchor is out by many seconds —
+    # which is exactly the case a narrow lag search cannot recover from.
+    base = (time_s - float(time_s[int(np.nanargmax(np.abs(load_raw)))])
+            + float(t[int(np.nanargmax(np.abs(f)))]))
+    duration = float(np.nanmax(time_s) - np.nanmin(time_s))
+    span = LAG_SEARCH_FRAC * duration if np.isfinite(duration) and duration > 0 else 0.0
+    best_lag, best_r = 0.0, -np.inf
+    for lag in (np.linspace(-span, span, LAG_SEARCH_STEPS) if span > 0 else [0.0]):
+        y = np.interp(base + lag, t, f, left=np.nan, right=np.nan)
+        m = np.isfinite(y) & np.isfinite(load_raw)
+        if m.sum() < 50:
+            continue
+        a, b = load_raw[m], y[m]
+        if a.std() == 0 or b.std() == 0:
+            continue
+        r = float(np.mean((a - a.mean()) * (b - b.mean())) / (a.std() * b.std()))
+        if r > best_r:
+            best_r, best_lag = r, float(lag)
+    if span > 0 and abs(abs(best_lag) - span) < span / (LAG_SEARCH_STEPS - 1):
+        # Optimum sits on the edge of the search: the true lag is outside it and
+        # the fit is against a misaligned ramp. Do not use it.
+        return (fallback, np.nan, np.nan,
+                f"peak ratio (lag search railed at {best_lag:+.2f} s — "
+                f"raise LAG_SEARCH_FRAC)")
+
+    f_mts = np.interp(base + best_lag, t, f, left=np.nan, right=np.nan)
+    mts_peak_abs = float(np.nanmax(np.abs(f)))
+    coverage = (float(np.nanmax(np.abs(f_mts))) / mts_peak_abs
+                if mts_peak_abs > 0 and np.isfinite(f_mts).any() else np.nan)
+
+    pk = float(np.nanmax(np.abs(f_mts))) if np.isfinite(f_mts).any() else 0.0
+    lo_f, hi_f = SCALE_FIT_BAND
+    band = (np.isfinite(f_mts) & np.isfinite(load_raw)
+            & (np.abs(f_mts) > lo_f * pk) & (np.abs(f_mts) < hi_f * pk))
+    if band.sum() < 20:
+        return fallback, np.nan, coverage, "peak ratio (too few in-band points)"
+
+    x, y = load_raw[band], f_mts[band]
+    slope, icept = (float(v) for v in np.polyfit(x, y, 1))
+    resid = y - (slope * x + icept)
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - float(np.sum(resid ** 2)) / ss_tot if ss_tot > 0 else np.nan
+    return slope, r2, coverage, (
+        f"regressed on {int(band.sum())} pts, lag {best_lag:+.3f} s, "
+        f"offset {icept:+.1f} N (not applied)")
+
+
 def smooth_signal(x):
     """Dispatches to the filter selected by FILTER_METHOD. No-op when
     APPLY_SMOOTHING is False."""
@@ -225,54 +494,80 @@ def _smooth_butterworth(x):
     out[nan_mask] = np.nan
     return out
 
+def read_specimen_csv() -> pd.DataFrame:
+    """The specimen sheet as raw text — every cell a string, nothing coerced.
+
+    dtype=str with keep_default_na=False is what makes the file safe to write
+    back: cells this script does not touch round-trip character for character,
+    so a Level-2 run cannot reformat a hand-entered geometry value or turn an
+    all-integer column into floats on its way through pandas.
+    """
+    for enc in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(SPECIMEN_CSV, encoding=enc,
+                               dtype=str, keep_default_na=False)
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"{SPECIMEN_CSV.name}: not decodable as "
+                       f"{'/'.join(CSV_ENCODINGS)}")
+
+def _cell(v) -> str:
+    """One specimen-sheet cell as text. Missing or non-finite writes blank, so
+    a property that could not be computed clears the cell instead of leaving
+    the previous run's value standing."""
+    if v is None:
+        return ""
+    v = float(v)
+    return "" if not np.isfinite(v) else f"{v:.12g}"
+
 def write_specimen_sheet(rows: list[dict]) -> None:
-    """Write each coupon's scalar properties into its row in SPECIMEN_SHEET,
+    """Write each coupon's scalar properties into its row of SPECIMEN_CSV,
     matched by Specimen ID. Adds any missing property columns at the end;
-    everything else in the workbook (other rows, formulas, formatting) is
-    left untouched. Skipped (with a warning) if the file can't be opened —
-    e.g. if it's currently open in Excel.
+    every other cell is written back exactly as it was read. Skipped with a
+    warning if the file can't be read or replaced — e.g. open in Excel.
     """
     try:
-        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
+        df = read_specimen_csv()
     except FileNotFoundError:
-        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
+        print(f"[!] {SPECIMEN_CSV} not found — skipping specimen sheet update")
         return
-    ws = wb.active
+    except Exception as exc:
+        print(f"[!] {SPECIMEN_CSV.name}: {exc} — skipping specimen sheet update")
+        return
 
-    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
-    id_col = header.get("Specimen ID")
-    if id_col is None:
+    if "Specimen ID" not in df.columns:
         print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
         return
 
-    next_col = ws.max_column + 1
     for label in SPECIMEN_SHEET_COLUMNS.values():
-        if label not in header:
-            ws.cell(row=1, column=next_col, value=label)
-            header[label] = next_col
-            next_col += 1
+        if label not in df.columns:
+            df[label] = ""
+    col_pos  = {c: j for j, c in enumerate(df.columns)}
+    row_by_id = {cid: i for i, cid in enumerate(df["Specimen ID"])}
 
-    row_by_id = {ws.cell(row=r, column=id_col).value: r
-                 for r in range(2, ws.max_row + 1)}
-
+    n_written = 0
     for row in rows:
-        r = row_by_id.get(row["coupon"])
-        if r is None:
+        i = row_by_id.get(row["coupon"])
+        if i is None:
+            print(f"[!] {row['coupon']} has no row in the specimen sheet — "
+                  f"its properties were not written")
             continue
         for key, label in SPECIMEN_SHEET_COLUMNS.items():
-            v = row.get(key)
-            v = None if (v is None or not np.isfinite(v)) else v
-            ws.cell(row=r, column=header[label], value=v)
+            df.iat[i, col_pos[label]] = _cell(row.get(key))
+        n_written += 1
 
-    # openpyxl doesn't evaluate formulas, so re-saving drops the cached
-    # values of every formula cell in the workbook (e.g. Width/Dia,
-    # Computed Area) until something recalculates them. Force a full
-    # recalculation on next open so they never appear blank.
-    wb.calculation.fullCalcOnLoad = True
+    # Write alongside the target and rename over it. The specimen sheet is now
+    # the only copy of the hand-entered geometry, so a half-written file would
+    # be real data loss rather than just a failed run.
+    tmp = SPECIMEN_CSV.with_name(SPECIMEN_CSV.name + ".tmp")
     try:
-        wb.save(SPECIMEN_SHEET)
-    except PermissionError:
-        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        os.replace(tmp, SPECIMEN_CSV)
+        print(f"Specimen sheet: {n_written} coupon(s) → {SPECIMEN_CSV.name}")
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"[!] could not update {SPECIMEN_CSV.name} ({exc}) — "
+              f"properties were not saved")
 
 def read_existing_group_stats(fp: Path) -> pd.DataFrame | None:
     """Read level2_group_stats.csv, upgrading the pre-'test' two-level layout.
@@ -325,7 +620,8 @@ def write_group_stats(rows: list[dict]) -> Path:
     df_sum["test"] = "tensile"
     df_sum["exposure"]  = df_sum["coupon"].map(lambda c: parse_id(c)[0])
     df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
-    agg_cols = ["E_GPa", "sigma_y_MPa", "UTS_MPa", "eps_at_UTS", "poisson_chord"]
+    agg_cols = ["E_GPa", "E_chord_GPa", "sigma_y_MPa", "UTS_MPa", "eps_at_UTS",
+                "poisson_chord"]
     group = (df_sum.groupby(["test", "exposure", "direction"])[agg_cols]
                    .agg(["mean", "std", "count"]))
 
@@ -353,15 +649,114 @@ def truncation_mask(force_N: np.ndarray) -> np.ndarray:
     if peak <= 0:
         return np.ones(n, dtype=bool)
     i_uts = int(np.nanargmax(np.abs(force_N)))
-    starts = np.where(np.abs(force_N) > LOAD_START_FRAC * peak)[0]
-    i0 = int(starts[0]) if len(starts) else 0
+    # Start on the *rising edge*, not the first sample over threshold: the
+    # pre-touchdown baseline sits near zero with noise either side of it, so
+    # "first sample above 2 % of peak" triggers on noise long before the
+    # specimen is loaded. Take the last sample below threshold before the peak.
+    # Same fix FlexuralDIC_Level2.truncation_mask already carries.
+    #
+    # On P01 this moves the start from frame 0–12 to frame 41–84 — i.e. the old
+    # rule was keeping 40–80 frames of pre-touchdown noise, and some of those
+    # frames carry near-zero stress with strain scattered into the modulus fit
+    # window, where they flatten the fit.
+    f_abs = np.abs(np.nan_to_num(force_N, nan=0.0))
+    below = np.flatnonzero(f_abs[:i_uts + 1] < LOAD_START_FRAC * peak)
+    i0 = int(below[-1]) + 1 if below.size else 0
     post = np.where(np.abs(force_N[i_uts:]) < LOAD_END_FRAC * peak)[0]
     # stop one frame BEFORE the first post-UTS drop-off so the failure point
     # itself isn't kept (it corrupts the smoothing pass)
     i1 = int(i_uts + post[0]) - 1 if len(post) else n - 1
     mask = np.zeros(n, dtype=bool)
-    mask[i0:i1 + 1] = True
+    # max(i0, i1) so a pathological record with i1 < i0 yields an empty window
+    # rather than a reversed slice that selects nothing while looking like it
+    # worked.
+    mask[i0:max(i0, i1) + 1] = True
     return mask
+
+
+def fit_modulus(eps: np.ndarray, sig: np.ndarray,
+                window: tuple[float, float]) -> tuple[float, float, int]:
+    """Least-squares slope of sigma against eps inside `window`.
+
+    Returns (slope MPa, toe offset in strain, n points). The toe offset is the
+    fit line's x-intercept — D638 Annex A1: extend the straight line back to
+    zero stress and take that as the true strain origin.
+
+    Fitted twice, and this is the same routine FlexuralDIC_Level2.fit_modulus
+    uses, so the two pipelines now compute a modulus the same way.
+    MODULUS_STRAIN_RANGE is a window in *corrected* strain, but the correction
+    is what the first fit produces, so the second pass re-selects the window
+    after shifting the origin.
+
+    Without the second pass, E is measured over corrected strain
+    [lo - toe, hi - toe] rather than [lo, hi], which contradicts the comment on
+    MODULUS_STRAIN_RANGE ("without including the toe"). It also makes the toe
+    correction a mathematical no-op for E: subtracting a constant from the
+    abscissa after the window is fixed shifts the origin without changing the
+    slope, so a single-pass "toe-corrected" E and an uncorrected one are equal
+    to the last digit.
+
+    SCALE OF THE EFFECT ON P01: small. Measured toe offsets are 1e-5 to 1e-4
+    strain, an order of magnitude below the window's 5e-4 lower bound, so the
+    iterated fit moves mean E by 0.16 %. The exception is P01-TCL45-01
+    (toe 1.1e-3, twice the window floor) — the coupon Level 3 excludes. This is
+    a correctness fix, not a large numerical one; see
+    tensile_modulus_sensitivity.py for the measurement.
+    """
+    toe = 0.0
+    slope = np.nan
+    n = 0
+    for _ in range(2):
+        e = eps - toe
+        m = (e >= window[0]) & (e <= window[1]) & np.isfinite(e) & np.isfinite(sig)
+        n = int(m.sum())
+        if n < 3:
+            return np.nan, np.nan, n
+        slope, icept = np.polyfit(e[m], sig[m], 1)
+        if slope == 0:
+            return np.nan, np.nan, n
+        toe = toe + (-icept / slope)      # x-intercept, accumulated
+    return float(slope), float(toe), n
+
+
+def chord_modulus(eps: np.ndarray, sig: np.ndarray,
+                  window: tuple[float, float]) -> float:
+    """Secant between the two ends of `window`, in already-toe-corrected strain.
+
+    Reported alongside the tangent modulus for the reason FlexuralDIC_Level2
+    reports Ef_*_chord_GPa alongside its tangent value: on this material the
+    tangent modulus is not a stable quantity. Sweeping the fit window over five
+    plausible ranges moves E by a median 7.7 % and up to 21.8 % per coupon —
+    larger than the 3.9 % within-group scatter it is being used to compare —
+    and the tangent fit's own R² is a median 0.879 (min 0.808), worst on the
+    45°/90° coupons.
+
+    A CHORD IS NOT A BETTER ESTIMATOR, and this one is not offered as the
+    number to report instead. It is read from two interpolated points, so where
+    the tangent averages strain noise over ~60 points the chord takes it at
+    face value: on P01 the chord itself moves 15–20 % between two neighbouring
+    windows on some coupons. What it gives you is transparency — a chord is
+    exactly "the average stiffness between these two strains", which is a claim
+    that survives being asked what window you used.
+
+    The pair is the useful output: tangent and chord agreeing means the segment
+    really is straight, and disagreeing (median +6.1 %, up to 33.6 % here)
+    means it isn't. Both go in the specimen sheet. See the README for what to do
+    about that.
+
+    Returns NaN rather than extrapolating when the data does not reach both
+    endpoints — np.interp would otherwise clamp at the end of the record and
+    return a confident-looking number computed from the wrong point.
+    """
+    m = np.isfinite(eps) & np.isfinite(sig)
+    if m.sum() < 3:
+        return np.nan
+    order = np.argsort(eps[m])
+    e, s = eps[m][order], sig[m][order]
+    lo, hi = window
+    if not (e[0] <= lo and hi <= e[-1]):
+        return np.nan
+    return float((np.interp(hi, e, s) - np.interp(lo, e, s)) / (hi - lo))
 
 
 # =============================================================================
@@ -398,19 +793,13 @@ def compute_properties(eps_axial, sig, eps_transverse,
     sig_unsmoothed = (np.asarray(sig_unsmoothed, dtype=float)[valid]
                        if sig_unsmoothed is not None else None)
 
-    # ---- 1. Modulus (D638 §11.4) --------------------------------------------
-    lo, hi = MODULUS_STRAIN_RANGE
-    mfit = (eps_raw >= lo) & (eps_raw <= hi) & np.isfinite(eps_raw) & np.isfinite(sig)
-    if mfit.sum() < 3:
+    # ---- 1+2. Modulus (D638 §11.4) and toe compensation (Annex A1) ----------
+    # One call, because they are not separable: the fit window is defined in
+    # toe-corrected strain and the correction comes out of the fit, so
+    # fit_modulus iterates. See its docstring.
+    E_MPa, eps_offset, n_fit = fit_modulus(eps_raw, sig, MODULUS_STRAIN_RANGE)
+    if not np.isfinite(E_MPa):
         return None
-    slope, intercept = np.polyfit(eps_raw[mfit], sig[mfit], 1)
-    E_MPa = float(slope)
-
-    # ---- 2. Toe compensation (D638 Annex A1) --------------------------------
-    # The fitted line σ = E·ε + b is extended back to σ = 0; that strain
-    # (b/(-E)) is the "toe offset" — all strains are then measured from the
-    # corrected origin. ε_corrected = ε_raw − ε_offset.
-    eps_offset = -intercept / E_MPa if E_MPa != 0 else 0.0
     eps   = eps_raw   - eps_offset
     eps_unsmoothed_corr = (eps_unsmoothed - eps_offset) if eps_unsmoothed is not None else None
     # Transverse strain: subtract its value at the corrected zero of axial strain.
@@ -455,9 +844,27 @@ def compute_properties(eps_axial, sig, eps_transverse,
         if ea[0] <= POISSON_CHORD_AT <= ea[-1]:
             nu_chord = float(-np.interp(POISSON_CHORD_AT, ea, et) / POISSON_CHORD_AT)
 
+    # ---- 6. Chord modulus ---------------------------------------------------
+    # Not a D638 requirement; reported as a cross-check on the tangent value,
+    # which is window-sensitive on this material. Over CHORD_STRAIN_RANGE, not
+    # MODULUS_STRAIN_RANGE — see that constant for why the two differ.
+    E_chord_MPa = chord_modulus(eps, sig, CHORD_STRAIN_RANGE)
+    # The record not spanning even the chord window means the truncation start
+    # has eaten into the strain range the properties are defined over, which is
+    # worth saying rather than emitting a bare NaN.
+    if not np.isfinite(E_chord_MPa):
+        finite_eps = eps[np.isfinite(eps)]
+        if finite_eps.size:
+            print(f"    [!] record spans corrected strain "
+                  f"[{finite_eps.min():.2e}, {finite_eps.max():.2e}] — does not "
+                  f"cover CHORD_STRAIN_RANGE {CHORD_STRAIN_RANGE}; chord modulus "
+                  f"not computed")
+
     return {
         "E_GPa":         E_MPa / 1000.0,
+        "E_chord_GPa":   E_chord_MPa / 1000.0 if np.isfinite(E_chord_MPa) else np.nan,
         "eps_toe":       eps_offset,
+        "n_fit":         n_fit,
         "sigma_y_MPa":   sigma_y,
         "eps_y":         eps_y,
         "UTS_MPa":       uts,
@@ -501,12 +908,19 @@ def main():
         area = (float(scalars.loc[cid, "area_mm2"])
                 if cid in scalars.index and pd.notna(scalars.loc[cid, "area_mm2"])
                 else np.nan)
-        if mts_peak is not None and raw_peak > 0:
-            scale = mts_peak / raw_peak
-            print(f"[{cid}] per-coupon scale: {scale:.4f} N/unit  (MTS {mts_peak:.0f} N)")
-        else:
-            scale = SCALE_N_PER_UNIT
-            print(f"[{cid}] combined scale: {scale:.4f} N/unit")
+        scale, scale_r2, coverage, scale_note = load_scale_for(
+            cid, load_raw, df, mts_peak, raw_peak)
+        print(f"[{cid}] scale {scale:.4f} N/unit  ({scale_note}"
+              + (f", R²={scale_r2:.5f}" if np.isfinite(scale_r2) else "") + ")")
+        if np.isfinite(scale_r2) and scale_r2 < SCALE_R2_MIN:
+            print(f"    [!] sync/MTS agreement is poor (R² < {SCALE_R2_MIN}) — "
+                  f"check the alignment before trusting this coupon's stresses")
+        if np.isfinite(coverage) and coverage < DIC_COVERAGE_MIN:
+            print(f"    [!] the DIC record only spans {coverage*100:.1f} % of the "
+                  f"MTS peak force — it stopped before the specimen did.\n"
+                  f"        UTS and strain-at-UTS for this coupon are NOT the "
+                  f"specimen's; a peak-anchored scale would be inflated ~"
+                  f"{(1/coverage - 1)*100:.0f} %.")
         force_N_all = load_raw * scale
 
         # ---- failure truncation ---------------------------------------------
@@ -532,6 +946,7 @@ def main():
             continue
 
         print(f"[{cid}]  E={p['E_GPa']:.2f} GPa  "
+              f"E_chord={p['E_chord_GPa']:.2f} GPa  "
               f"σ_y={p['sigma_y_MPa']:.1f} MPa  "
               f"UTS={p['UTS_MPa']:.1f} MPa  "
               f"ε_UTS={p['eps_at_UTS']*100:.2f}%  "
@@ -555,7 +970,14 @@ def main():
         df["strain_axial_unsmoothed"]  = scatter(p["_eps_raw"])
         df.to_csv(frames_fp, index=False, float_format="%.6g")
 
-        rows.append({"coupon": cid, **{k: v for k, v in p.items() if not k.startswith("_")}})
+        rows.append({"coupon": cid,
+                     **{k: v for k, v in p.items() if not k.startswith("_")},
+                     # Provenance for the stress axis, recorded per coupon so a
+                     # suspect scale is visible in the specimen sheet rather than only
+                     # in this run's console output.
+                     "scale_N_per_unit": scale,
+                     "scale_r2": scale_r2,
+                     "dic_coverage": coverage})
 
     if rows:
         write_specimen_sheet(rows)
@@ -563,7 +985,7 @@ def main():
         # ---- D638 §11.7 / §12.1: mean & std per (exposure, direction) -------
         write_group_stats(rows)
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_CSV.name}, "
               f"DIC/level2_group_stats.csv")
 
     print(f"\nDone. {time.time()-t0:.1f} s")

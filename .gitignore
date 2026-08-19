@@ -1,9 +1,11 @@
 *
 !.gitignore
 !README.md
+!mts_plots.py
 !TensileDIC_Level1.py
 !TensileDIC_Level2.py
 !TensileDIC_Level2_tmp.py
 !TensileDIC_Level3.py
 !FlexuralDIC_Level1.py
 !FlexuralDIC_Level2.py
+

@@ -28,12 +28,13 @@ column of its own)
                                derives — kept separate from Level-1's own
                                disp_mm, which stays untouched as the raw
                                sync-CSV reference).
-  FSR-SpecimenTesting.xlsx   scalar properties written into each coupon's row
+  FSR-SpecimenTesting.csv    scalar properties written into each coupon's row
   <DIC_DIR>/level2_group_stats.csv   D638 §11.7 mean/std/count by exposure×direction
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -42,7 +43,6 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import median_filter
 from scipy.signal import butter, filtfilt
-import openpyxl
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -55,10 +55,26 @@ DIC_DIR = Path(
     r"\P01-LT150-LH4.5\DIC"
 )
 MTS_DIR = DIC_DIR.parent / "MTS"
-SPECIMEN_SHEET = Path(
+
+# Specimen sheet. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# "Width / Dia. (in)" and "Computed Area (in²)" used to be FORMULA cells in
+# FSR-SpecimenTesting.xlsx, and openpyxl does not evaluate formulas: every time
+# a Level 2 saved its scalars back into the workbook it wrote the formula and
+# dropped the cached value, so Level 1 read those columns back as blank, wrote
+# area_mm2 = NaN, and Level 2 then reported "insufficient data" for every
+# coupon. The workbook is retired. FSR-SpecimenTesting.csv holds evaluated
+# values, needs no Excel engine, is not locked while something else has it
+# open, and is what every script in this folder now both reads and writes.
+SPECIMEN_CSV = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.csv"
 )
+
+# The CSV started life as a Windows Excel export, so its superscript characters
+# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
+# order; write_specimen_sheet re-writes the file as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # Raw DIC-sync CSVs (unreliable displacement channel, but their Time column
 # and force *shape* are what we use to locate the peak-force row per coupon).
@@ -77,7 +93,7 @@ EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
-APPLY_SMOOTHING = False  # ASTM D638 does not call for filtering the stress-strain record;
+APPLY_SMOOTHING = True  # ASTM D638 does not call for filtering the stress-strain record;
                           # toggle on only if a batch's raw signal is genuinely too noisy.
 FILTER_METHOD   = "butterworth"  # "median" or "butterworth" — see SMOOTHING section below
 
@@ -243,44 +259,80 @@ def _smooth_butterworth(x):
     out[nan_mask] = np.nan
     return out
 
-def write_specimen_sheet(rows: list[dict]) -> None:
-    try:
-        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
-    except FileNotFoundError:
-        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
-        return
-    ws = wb.active
+def read_specimen_csv() -> pd.DataFrame:
+    """The specimen sheet as raw text — every cell a string, nothing coerced.
 
-    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
-    id_col = header.get("Specimen ID")
-    if id_col is None:
+    dtype=str with keep_default_na=False is what makes the file safe to write
+    back: cells this script does not touch round-trip character for character,
+    so a Level-2 run cannot reformat a hand-entered geometry value or turn an
+    all-integer column into floats on its way through pandas.
+    """
+    for enc in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(SPECIMEN_CSV, encoding=enc,
+                               dtype=str, keep_default_na=False)
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"{SPECIMEN_CSV.name}: not decodable as "
+                       f"{'/'.join(CSV_ENCODINGS)}")
+
+def _cell(v) -> str:
+    """One specimen-sheet cell as text. Missing or non-finite writes blank, so
+    a property that could not be computed clears the cell instead of leaving
+    the previous run's value standing."""
+    if v is None:
+        return ""
+    v = float(v)
+    return "" if not np.isfinite(v) else f"{v:.12g}"
+
+def write_specimen_sheet(rows: list[dict]) -> None:
+    """Write each coupon's scalar properties into its row of SPECIMEN_CSV,
+    matched by Specimen ID. Adds any missing property columns at the end;
+    every other cell is written back exactly as it was read. Skipped with a
+    warning if the file can't be read or replaced — e.g. open in Excel.
+    """
+    try:
+        df = read_specimen_csv()
+    except FileNotFoundError:
+        print(f"[!] {SPECIMEN_CSV} not found — skipping specimen sheet update")
+        return
+    except Exception as exc:
+        print(f"[!] {SPECIMEN_CSV.name}: {exc} — skipping specimen sheet update")
+        return
+
+    if "Specimen ID" not in df.columns:
         print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
         return
 
-    next_col = ws.max_column + 1
     for label in SPECIMEN_SHEET_COLUMNS.values():
-        if label not in header:
-            ws.cell(row=1, column=next_col, value=label)
-            header[label] = next_col
-            next_col += 1
+        if label not in df.columns:
+            df[label] = ""
+    col_pos  = {c: j for j, c in enumerate(df.columns)}
+    row_by_id = {cid: i for i, cid in enumerate(df["Specimen ID"])}
 
-    row_by_id = {ws.cell(row=r, column=id_col).value: r
-                 for r in range(2, ws.max_row + 1)}
-
+    n_written = 0
     for row in rows:
-        r = row_by_id.get(row["coupon"])
-        if r is None:
+        i = row_by_id.get(row["coupon"])
+        if i is None:
+            print(f"[!] {row['coupon']} has no row in the specimen sheet — "
+                  f"its properties were not written")
             continue
         for key, label in SPECIMEN_SHEET_COLUMNS.items():
-            v = row.get(key)
-            v = None if (v is None or not np.isfinite(v)) else v
-            ws.cell(row=r, column=header[label], value=v)
+            df.iat[i, col_pos[label]] = _cell(row.get(key))
+        n_written += 1
 
-    wb.calculation.fullCalcOnLoad = True
+    # Write alongside the target and rename over it. The specimen sheet is now
+    # the only copy of the hand-entered geometry, so a half-written file would
+    # be real data loss rather than just a failed run.
+    tmp = SPECIMEN_CSV.with_name(SPECIMEN_CSV.name + ".tmp")
     try:
-        wb.save(SPECIMEN_SHEET)
-    except PermissionError:
-        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        os.replace(tmp, SPECIMEN_CSV)
+        print(f"Specimen sheet: {n_written} coupon(s) → {SPECIMEN_CSV.name}")
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"[!] could not update {SPECIMEN_CSV.name} ({exc}) — "
+              f"properties were not saved")
 
 def read_existing_group_stats(fp: Path) -> pd.DataFrame | None:
     """Read level2_group_stats.csv, upgrading the pre-'test' two-level layout.
@@ -359,12 +411,16 @@ def truncation_mask(force_N: np.ndarray) -> np.ndarray:
     if peak <= 0:
         return np.ones(n, dtype=bool)
     i_uts = int(np.nanargmax(np.abs(force_N)))
-    starts = np.where(np.abs(force_N) > LOAD_START_FRAC * peak)[0]
-    i0 = int(starts[0]) if len(starts) else 0
+    # Rising edge, not the first sample over threshold — kept byte-identical in
+    # behaviour to TensileDIC_Level2.truncation_mask on purpose, since this
+    # variant writes to the same outputs. See that function for the reasoning.
+    f_abs = np.abs(np.nan_to_num(force_N, nan=0.0))
+    below = np.flatnonzero(f_abs[:i_uts + 1] < LOAD_START_FRAC * peak)
+    i0 = int(below[-1]) + 1 if below.size else 0
     post = np.where(np.abs(force_N[i_uts:]) < LOAD_END_FRAC * peak)[0]
     i1 = int(i_uts + post[0]) - 1 if len(post) else n - 1
     mask = np.zeros(n, dtype=bool)
-    mask[i0:i1 + 1] = True
+    mask[i0:max(i0, i1) + 1] = True
     return mask
 
 
@@ -589,7 +645,7 @@ def main():
 
         write_group_stats(rows)
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_CSV.name}, "
               f"DIC/level2_group_stats.csv")
 
     print(f"\nDone. {time.time()-t0:.1f} s")

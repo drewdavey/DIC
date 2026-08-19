@@ -27,7 +27,7 @@ INPUT per coupon
   <coupon_dir>/*.out                    VIC-3D full-field export, one per DIC frame
   <coupon_dir>/<coupon_id>.csv           VIC sync CSV (analog channels @ DIC frame rate)
   <MTS_DIR>/<coupon_id>*.txt             MTS raw file: cols disp_mm, force_N, output_V, time_s
-  FSR-SpecimenTesting.xlsx               gauge thickness × width  →  area
+  FSR-SpecimenTesting.csv                gauge thickness × width  →  area
 
 OUTPUTS
 -------
@@ -35,11 +35,19 @@ OUTPUTS
 - <DIC_DIR>/<coupon_id>.csv              full per-frame record: step, time_s,
                                          disp_mm, load_raw, strain_axial_raw,
                                          strain_transverse_raw.
+                                         time_s is ELAPSED SECONDS from the first
+                                         frame, not the raw Unix epoch — see build_l1
+                                         for why (the epoch did not survive %.6g).
                                          Level-2 reads this same file and appends
                                          its own columns in place — see its docstring.
 - <DIC_DIR>/coupon_scalars.csv           one row per coupon: coupon, mts_peak_N,
-                                         area_mm2 — the only place these two scalars
-                                         are stored (not repeated in the per-frame CSV).
+                                         area_mm2, t0_epoch_s (absolute start that
+                                         time_s is measured from), axial_gauge_mm and
+                                         trans_gauge_mm (the gauge lengths actually
+                                         used, which differ from the requested ones
+                                         if ext_endpoints clipped them to the ROI)
+                                         — the only place these scalars are stored
+                                         (not repeated in the per-frame CSV).
 - <FIGS_ROOT>/<coupon_id>/MTS_force_disp.png   raw MTS curve (sanity check)
 - <FIGS_ROOT>/<coupon_id>/MTS_force_displacement_signals.png       raw MTS force/disp vs. time
 - <FIGS_ROOT>/<coupon_id>/DIC_sync_force_displacement_signals.png  raw vs. scaled DIC-sync channels
@@ -84,10 +92,33 @@ DATA_ROOTS = {
     "UV": DIC_DIR / "raw" / "2026_FSR_TensileTest_TSW_TIS_TUV",
     "IS": DIC_DIR / "raw" / "2026_FSR_TensileTest_TSW_TIS_TUV",
 }
-SPECIMEN_SHEET = Path(
+# Specimen geometry. THE CSV *IS* THE SHEET — there is no .xlsx any more.
+#
+# 'Width / Dia. (in)' and 'Computed Area (in²)' used to be FORMULA cells in
+# FSR-SpecimenTesting.xlsx. openpyxl does not evaluate formulas, so every time
+# Level 2 wrote its scalars back into the workbook it saved the formula and
+# dropped the cached value; only Excel itself honoured the recalculate-on-open
+# flag it set. pandas and openpyxl both read the CACHE, so until somebody
+# opened the workbook by hand and saved it, those columns read as blank. Level
+# 1 then computed area = thickness x NaN, wrote area_mm2 = NaN to
+# coupon_scalars.csv, and Level 2 reported "insufficient data" for every coupon
+# — the stress axis was entirely NaN.
+#
+# So the workbook is retired. FSR-SpecimenTesting.csv holds evaluated values,
+# needs no Excel engine, is not locked while something else has it open, and is
+# what every script in this folder now reads — and what the Level 2s write
+# their scalars back into. load_specimen_sheet() still refuses rather than
+# proceeding with NaN geometry if the width column comes back empty.
+SPECIMEN_STEM  = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
-    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting"
 )
+SPECIMEN_CSV   = SPECIMEN_STEM.with_suffix(".csv")
+
+# The CSV started life as a Windows Excel export, so its superscript characters
+# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
+# order; the Level 2s re-write the file as utf-8-sig.
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 FIGS_ROOT = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
@@ -109,7 +140,7 @@ REPLICATES = ["01", "02", "03"]
 DO_EXPORT_FRAMES = True     # Step A: export each .out to a CSV next to it
 OVERWRITE_FRAMES = False    # if False, skip .out files whose .csv already exists
 DO_BUILD_L1      = True     # Step B: pair frames + MTS, build extensometers
-OVERWRITE_L1     = False    # if False, skip coupons whose per-coupon CSV already exists
+OVERWRITE_L1     = True    # if False, skip coupons whose per-coupon CSV already exists
 DO_SIGNAL_PLOTS  = True     # Step C: raw MTS + DIC-sync signal-inspection plots + report CSV
 
 # If True, displacement signals in the Step C plots are shifted so the first
@@ -131,10 +162,24 @@ EXPORT_VARS = [
 
 # =============================================================================
 # VIRTUAL EXTENSOMETER  — ASTM D638 §5.2.1 (Class B-2 equivalent for modulus)
-# Gauge length 50 mm (2 in) per D638 Type I Fig. 1.
+#
+# These are FSR reef coupons, not D638 Type I dogbones: the gauge section is
+# ~34 mm wide × ~14 mm thick (≈480 mm² — a Type I is ≈41 mm²) and the
+# correlated ROI runs 137–149 mm along the loading axis. The 2.00 in (50.8 mm)
+# gauge in D638 Fig. 1 is specified for the Type I geometry and does not carry
+# over; AXIAL_GAUGE_IN below is sized to this specimen, and sits comfortably
+# inside the ROI on every P01 coupon (verified — see the clip check in
+# ext_endpoints, which prints a warning if it ever stops being true).
 # =============================================================================
-AXIAL_GAUGE_IN = 4.36       # axial (Y, loading) gauge length, inches  [D638 G = 2.00 in]
+AXIAL_GAUGE_IN = 4.36       # axial (Y, loading) gauge length, inches  (110.7 mm)
 TRANS_GAUGE_IN = 1.0        # transverse (X) gauge length, inches      [Annex A3.5.2]
+
+# VIC-3D correlation confidence (sigma) cutoff for points eligible to be an
+# extensometer endpoint. EXPORT_VARS requests sigma so it can be filtered on,
+# but the P01 exports on disk do not contain it, so this filter is inert on
+# that batch — point_extensometer applies it only when the column is present.
+# Set to None to disable it outright.
+SIGMA_MAX = 0.10
 
 # =============================================================================
 # CONSTANTS
@@ -204,23 +249,72 @@ def load_mts_txt(fp):
               .apply(pd.to_numeric, errors="coerce")
               .dropna(subset=["force_N"]))
 
+def _read_specimen_table() -> tuple[pd.DataFrame, Path]:
+    """Specimen sheet as (dataframe, path actually read).
+
+    See the SPECIMEN_CSV block above for why this reads a CSV and not a
+    workbook. Only the encoding is in question, so try each in turn and report
+    every failure at once rather than only the last.
+    """
+    problems = []
+    if SPECIMEN_CSV.exists():
+        for enc in CSV_ENCODINGS:
+            try:
+                return pd.read_csv(SPECIMEN_CSV, encoding=enc), SPECIMEN_CSV
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:              # malformed CSV, locked file
+                problems.append(f"{SPECIMEN_CSV.name} [{enc}]: {exc}")
+                break
+        else:
+            problems.append(f"{SPECIMEN_CSV.name}: not decodable as "
+                            f"{'/'.join(CSV_ENCODINGS)}")
+    else:
+        problems.append(f"{SPECIMEN_CSV.name}: not found")
+
+    raise RuntimeError("Could not read the specimen sheet:\n  "
+                       + "\n  ".join(problems))
+
+
 def load_specimen_sheet():
-    df = pd.read_excel(SPECIMEN_SHEET)
+    df, src = _read_specimen_table()
     t_col = next((c for c in df.columns if "thickness" in c.lower()), None)
     w_col = next((c for c in df.columns if "width" in c.lower() and "dia" in c.lower()), None)
     if t_col is None or w_col is None:
-        raise RuntimeError(f"could not find thickness/width cols in {SPECIMEN_SHEET}")
+        raise RuntimeError(f"could not find thickness/width cols in {src}")
     df = df.rename(columns={t_col: "t_in", w_col: "w_in"})
-    return df.set_index("Specimen ID")
+    df = df.set_index("Specimen ID")
+
+    # Fail loudly instead of quietly producing NaN areas: silently continuing
+    # writes area_mm2 = NaN for every coupon, and Level 2 then reports
+    # "insufficient data" with no clue why.
+    w = pd.to_numeric(df["w_in"], errors="coerce")
+    if not w.notna().any():
+        raise RuntimeError(
+            f"'{w_col}' is empty for every specimen in {src.name}.\n"
+            f"    Fix: fill it in {SPECIMEN_CSV.name}. That file is a plain "
+            f"CSV now — edit it directly, or re-export it from a spreadsheet.")
+    print(f"Specimen geometry: {src.name} "
+          f"({int(w.notna().sum())} rows with a width)")
+    return df
 
 def get_area_mm2(spec, cid):
-    """ASTM D638 §11.2: stress uses *original* cross-sectional area."""
+    """ASTM D638 §11.2: stress uses *original* cross-sectional area.
+
+    Returns None — not NaN — when either dimension is missing. build_l1 tests
+    `area_mm2 is None` to decide whether to warn, so a NaN slipped through that
+    check and propagated silently all the way to Level 2's "insufficient data".
+    """
     if cid not in spec.index:
         return None
     row = spec.loc[cid]
     if isinstance(row, pd.DataFrame):
         row = row.iloc[0]
-    return float(row["t_in"]) * float(row["w_in"]) * IN2MM * IN2MM
+    t = pd.to_numeric(row["t_in"], errors="coerce")
+    w = pd.to_numeric(row["w_in"], errors="coerce")
+    if not (np.isfinite(t) and np.isfinite(w)):
+        return None
+    return float(t) * float(w) * IN2MM * IN2MM
 
 
 # =============================================================================
@@ -308,10 +402,22 @@ def ext_endpoints(frame_csv0, axial_mm, trans_mm):
     Y_bot = max(Yc - axial_mm / 2, Ymin)
     X_rgt = min(Xc + trans_mm / 2, Xmax)
     X_lft = max(Xc - trans_mm / 2, Xmin)
+    # The clip above is silent otherwise, and it changes what was measured: a
+    # clipped gauge is whatever this coupon's correlated field happened to
+    # span, not AXIAL_GAUGE_IN, and it differs coupon to coupon with speckle
+    # quality and lighting. Say so, and let coupon_scalars.csv carry the length
+    # actually used. (No P01 coupon clips — the ROI is 137–149 mm against a
+    # 110.7 mm gauge — but a tighter ROI on a future batch would.)
+    if Yc + axial_mm / 2 > Ymax or Yc - axial_mm / 2 < Ymin:
+        print(f"    [!] axial gauge clipped to ROI: requested {axial_mm:.1f} mm, "
+              f"got {Y_top - Y_bot:.1f} mm")
+    if Xc + trans_mm / 2 > Xmax or Xc - trans_mm / 2 < Xmin:
+        print(f"    [!] transverse gauge clipped to ROI: requested {trans_mm:.1f} mm, "
+              f"got {X_rgt - X_lft:.1f} mm")
     return Xc, Y_bot, Y_top, X_lft, X_rgt, Yc
 
 
-def point_extensometer(frame_csvs, x0, y0, x1, y1):
+def point_extensometer(frame_csvs, x0, y0, x1, y1, sigma_max=SIGMA_MAX):
     """
     VIC-3D style extensometer: two fixed endpoint markers at (x0,y0) and (x1,y1).
     For every frame find the nearest DIC point to each endpoint (mirrors
@@ -320,29 +426,88 @@ def point_extensometer(frame_csvs, x0, y0, x1, y1):
 
         ε = (L_deformed − L₀) / L₀
         L₀ = √((x1−x0)² + (y1−y0)²)
+
+    Two hardening changes over a literal at_global_xy transcription. Neither
+    alters the P01 numbers — both failure modes were checked against the P01
+    frame CSVs and neither fires (see below) — they are guards against a batch
+    where the correlation is worse.
+
+    1. Points are filtered on `sigma` (correlation confidence) before the
+       nearest search: EXPORT_VARS requests sigma precisely so it can be
+       filtered on, and a low-confidence point that happens to be nearest is
+       worse than the next-nearest good one. INERT ON P01: those exports have
+       no sigma column, so the filter is skipped. It takes effect only after a
+       Step-A re-export that actually carries sigma.
+
+    2. The two endpoints are located ONCE, in the reference frame, and
+       thereafter tracked by their reference-frame coordinates. Re-running the
+       nearest search against a frame that has lost the chosen point silently
+       substitutes a neighbouring subset with different U,V, which puts a
+       discrete step in the strain record — the sort of step that survives
+       smoothing and reads as material behaviour. `n_switched` counts how often
+       the tracked point had to be substituted anyway. NOT OBSERVED ON P01: the
+       subset grid is ~0.003 mm along Y and no P01 frame has a NaN
+       displacement, so the same point is picked every frame.
+
+    dx/dy keep the original convention — requested endpoint coordinates plus
+    the matched point's displacement — since the matched point is at most half
+    a subset step (~0.0015 mm) from the request.
+
+    Returns (eps, diag). diag carries L0_mm, n_switched, n_dropped and the
+    reference-frame coordinates the endpoints actually landed on, which are NOT
+    the requested ones.
     """
     L0 = float(np.sqrt((x1 - x0)**2 + (y1 - y0)**2))
+    diag = {"L0_mm": L0, "n_switched": 0, "n_dropped": 0,
+            "p0_xy": None, "p1_xy": None}
     if L0 == 0:
-        return np.full(len(frame_csvs), np.nan)
+        return np.full(len(frame_csvs), np.nan), diag
 
-    eps = []
-    for fp in frame_csvs:
+    def clean(fp):
         try:
             df = pd.read_csv(fp).dropna(subset=["X", "Y", "U", "V"])
         except Exception:
-            eps.append(np.nan); continue
-        if len(df) < 2:
-            eps.append(np.nan); continue
+            return None
+        if sigma_max is not None and "sigma" in df.columns:
+            df = df[df["sigma"].between(0, sigma_max)]
+        return df if len(df) >= 2 else None
 
-        # Nearest DIC point to each endpoint (at_global_xy equivalent)
-        r0 = df.loc[((df["X"] - x0)**2 + (df["Y"] - y0)**2).idxmin()]
-        r1 = df.loc[((df["X"] - x1)**2 + (df["Y"] - y1)**2).idxmin()]
+    def nearest(df, ax, ay):
+        d2 = (df["X"] - ax)**2 + (df["Y"] - ay)**2
+        i = d2.idxmin()
+        return i, float(np.sqrt(d2.loc[i]))
 
-        dx = (x1 + float(r1["U"])) - (x0 + float(r0["U"]))
-        dy = (y1 + float(r1["V"])) - (y0 + float(r0["V"]))
+    ref = clean(frame_csvs[0])
+    if ref is None:
+        return np.full(len(frame_csvs), np.nan), diag
+    i0r, _ = nearest(ref, x0, y0)
+    i1r, _ = nearest(ref, x1, y1)
+    a0 = (float(ref.loc[i0r, "X"]), float(ref.loc[i0r, "Y"]))
+    a1 = (float(ref.loc[i1r, "X"]), float(ref.loc[i1r, "Y"]))
+    diag["p0_xy"], diag["p1_xy"] = a0, a1
+
+    # Subset spacing, for deciding whether a match is the same point or a
+    # neighbour. Median nearest-neighbour distance along Y is a good proxy.
+    ys = np.sort(ref["Y"].unique())
+    step = float(np.median(np.diff(ys))) if ys.size > 1 else 0.0
+    tol = 0.25 * step if step > 0 else 0.0
+
+    eps = []
+    for fp in frame_csvs:
+        df = clean(fp)
+        if df is None:
+            eps.append(np.nan)
+            diag["n_dropped"] += 1
+            continue
+        j0, d0 = nearest(df, *a0)
+        j1, d1 = nearest(df, *a1)
+        if tol > 0 and (d0 > tol or d1 > tol):
+            diag["n_switched"] += 1
+        dx = (x1 + float(df.loc[j1, "U"])) - (x0 + float(df.loc[j0, "U"]))
+        dy = (y1 + float(df.loc[j1, "V"])) - (y0 + float(df.loc[j0, "V"]))
         eps.append((np.sqrt(dx**2 + dy**2) - L0) / L0)
 
-    return np.array(eps)
+    return np.array(eps), diag
 
 
 # =============================================================================
@@ -420,8 +585,19 @@ def build_l1(cid, cdir, spec) -> dict | None:
     else:
         disp_mm = np.full_like(load_raw, np.nan)
 
-    time_s = (pd.to_numeric(sync[time_col], errors="coerce").to_numpy()
-              if time_col else np.arange(len(load_raw), dtype=float))
+    # Time_0_0 is an absolute Unix epoch (~1.7756e9 s). Writing that verbatim
+    # through to_csv(float_format="%.6g") below quantised it to 6 significant
+    # figures — steps of 10 000 s — and every row of every per-coupon CSV came
+    # out with the SAME time_s. The one channel the README calls trustworthy
+    # was being destroyed on write. Store elapsed seconds from the first frame
+    # instead: ~50 s spans, so %.6g keeps sub-millisecond resolution, and it is
+    # the form every consumer wanted anyway. The absolute start goes into
+    # coupon_scalars.csv as t0_epoch_s so nothing is lost.
+    time_abs = (pd.to_numeric(sync[time_col], errors="coerce").to_numpy(dtype=float)
+                if time_col else np.arange(len(load_raw), dtype=float))
+    finite_t = np.flatnonzero(np.isfinite(time_abs))
+    t0_epoch = float(time_abs[finite_t[0]]) if finite_t.size else np.nan
+    time_s = time_abs - t0_epoch if np.isfinite(t0_epoch) else time_abs
 
     # ---- align to DIC frame count ----
     n = min(len(load_raw), len(frame_fps))
@@ -437,8 +613,14 @@ def build_l1(cid, cdir, spec) -> dict | None:
           f"L={Y_top-Y_bot:.1f} mm")
     print(f"    E1 transverse (Yc={Yc:.1f})  X: {X_lft:.1f} → {X_rgt:.1f}  "
           f"L={X_rgt-X_lft:.1f} mm")
-    eps_a = point_extensometer(frame_fps_used, Xc, Y_bot, Xc, Y_top)
-    eps_t = point_extensometer(frame_fps_used, X_lft, Yc, X_rgt, Yc)
+    eps_a, diag_a = point_extensometer(frame_fps_used, Xc, Y_bot, Xc, Y_top)
+    eps_t, diag_t = point_extensometer(frame_fps_used, X_lft, Yc, X_rgt, Yc)
+    for nm, dg in (("axial", diag_a), ("transverse", diag_t)):
+        if dg["n_switched"]:
+            print(f"    [!] {nm}: endpoint substituted on {dg['n_switched']} "
+                  f"frames — ROI is losing correlation at the gauge ends")
+        if dg["n_dropped"]:
+            print(f"    [!] {nm}: {dg['n_dropped']} frames had no usable field")
 
     # ---- write ----
     # force_N and stress_MPa are NOT saved — Level-2 computes them after
@@ -457,7 +639,14 @@ def build_l1(cid, cdir, spec) -> dict | None:
     }).to_csv(out_fp, index=False, float_format="%.6g")
     print(f"  → DIC/{out_fp.name} ({n} rows)")
     return {"coupon": cid, "mts_peak_N": peak_force_N,
-            "area_mm2": area_mm2 if area_mm2 else np.nan}
+            "area_mm2": area_mm2 if area_mm2 else np.nan,
+            # t0_epoch_s preserves the absolute start that time_s is now
+            # measured from. axial/trans_gauge_mm are the gauge lengths
+            # ACTUALLY used — equal to the requested ones unless ext_endpoints
+            # clipped them to the ROI, which it now says out loud.
+            "t0_epoch_s": t0_epoch,
+            "axial_gauge_mm": Y_top - Y_bot,
+            "trans_gauge_mm": X_rgt - X_lft}
 
 
 # =============================================================================
@@ -726,11 +915,18 @@ def write_dic_report(coupons) -> Path:
     return out_fp
 
 def write_coupon_scalars(rows: list[dict]) -> Path:
-    """Upsert this run's per-coupon scalars (mts_peak_N, area_mm2) into
-    coupon_scalars.csv — the single place these are stored, so they're
-    never repeated down every row of a per-frame CSV. Coupons skipped this
-    run (their per-coupon CSV already existed and OVERWRITE_L1 is False)
-    keep whatever row is already on disk from a previous run."""
+    """Upsert this run's per-coupon scalars (mts_peak_N, area_mm2, t0_epoch_s,
+    axial/trans_gauge_mm) into coupon_scalars.csv — the single place these are
+    stored, so they're never repeated down every row of a per-frame CSV.
+    Coupons skipped this run (their per-coupon CSV already existed and
+    OVERWRITE_L1 is False) keep whatever row is already on disk from a
+    previous run.
+
+    float_format is %.12g, not the %.6g used elsewhere: t0_epoch_s is a Unix
+    epoch near 1.78e9, and 6 significant figures rounds it to the nearest
+    10 000 s. This is the same rounding that silently flattened the per-frame
+    time_s column — see build_l1.
+    """
     out_fp = DIC_DIR / "coupon_scalars.csv"
     DIC_DIR.mkdir(parents=True, exist_ok=True)
     merged = {}
@@ -740,7 +936,7 @@ def write_coupon_scalars(rows: list[dict]) -> Path:
     for row in rows:
         merged[row["coupon"]] = row
     pd.DataFrame(sorted(merged.values(), key=lambda r: r["coupon"])
-                ).to_csv(out_fp, index=False, float_format="%.6g")
+                ).to_csv(out_fp, index=False, float_format="%.12g")
     print(f"Coupon scalars: {out_fp}")
     return out_fp
 
