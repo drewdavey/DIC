@@ -267,7 +267,12 @@ plotting here (see Level 3).
   scalar properties are stored** — Level 3 reads them back out of here
   rather than recomputing.
 - `<DIC_DIR>/level2_group_stats.csv` — D638 §11.7 mean/std/count per
-  (exposure, direction) group.
+  (exposure, direction) group, under a `test` index level of `"tensile"`.
+  **Shared with `FlexuralDIC_Level2.py`.** That index level is load-bearing:
+  both test types have CL and IS exposures at 00 and 90, so without it the two
+  would overwrite each other. Each script replaces only its own test's rows.
+  Files written before the `test` level existed are read as tensile-only and
+  upgraded in place.
 
 #### Variant — `TensileDIC_Level2_tmp.py`
 
@@ -374,10 +379,13 @@ exactly the tensile convention. Level 1 writes `<DIC_DIR>/<coupon_id>.csv`, one
 row per DIC frame, untruncated; Level 2 reads that same file and appends its
 own columns in place. Truncation sets a boolean `kept` column rather than
 dropping rows. Per-coupon scalars live once each in
-`<DIC_DIR>/flexural_geometry.csv` (Level 1) and
-`<DIC_DIR>/flexural_properties.csv` (Level 2). Flexural and tensile per-coupon
-CSVs share the same `DIC_DIR` and never collide, because the coupon IDs differ
-(`P01-F…` vs `P01-T…`).
+`<DIC_DIR>/coupon_scalars.csv` (Level 1) and in `FSR-SpecimenTesting.xlsx`
+(Level 2) — the same two places the tensile pipeline puts them. Flexural and
+tensile per-coupon CSVs share the same `DIC_DIR`, and the flexural rows share
+`coupon_scalars.csv` and the workbook with the tensile ones, without colliding,
+because the coupon IDs differ (`P01-F…` vs `P01-T…`). There are no
+`flexural_*`-prefixed files any more; the two test types use one set of
+files throughout.
 
 **Why this isn't the tensile pipeline with different constants.** The tensile
 pipeline reduces each frame to two virtual point extensometers, which is the
@@ -442,8 +450,11 @@ below. The constant is defined separately in both levels and the two must match.
 ### Level 1 — `FlexuralDIC_Level1.py`
 
 **Step A** — dumps each `.out` to a CSV next to it, the way tensile Step A
-does. **Off by default** (`DO_EXPORT_FRAMES = False`): Step B holds each frame
-in memory anyway, so nothing reads these files, and they are ~1 GB per coupon.
+does, with the identical `EXPORT_VARS` column list, so a flexural per-frame CSV
+and a tensile one are interchangeable. **On** (`DO_EXPORT_FRAMES = True`), to
+match tensile. Step B does not read these — it loads each `.out` itself — but
+`dic_heatmap_animation.py` does, and reading a CSV needs no vicpyx. Budget
+~1 GB per coupon.
 
 **Step B** — reduces every `.out` frame to the bending kinematics, pairs them
 with the MTS record, and writes the per-coupon CSV. The slow step (~50–60 s per
@@ -533,7 +544,8 @@ midspan value is scaled back up using the ideal 3-point shape
 
 **Switches**
 - `DO_LIST_VARS` — Step C. Cheap; leave on.
-- `DO_EXPORT_FRAMES` / `OVERWRITE_FRAMES` — Step A. Off by default.
+- `DO_EXPORT_FRAMES` / `OVERWRITE_FRAMES` — Step A. On by default, as tensile.
+  `OVERWRITE_FRAMES` defaults `False`: skip `.out` files whose `.csv` exists.
 - `DO_BUILD_L1` / `OVERWRITE_L1` — Step B. `OVERWRITE_L1` defaults `False`:
   skip coupons whose per-coupon CSV already exists.
 - `PRINTS` / `EXPOSURES` / `DIRECTIONS` / `REPLICATES` — coupon selection.
@@ -555,20 +567,22 @@ midspan value is scaled back up using the ideal 3-point shape
 - `<DIC_DIR>/<coupon_id>.csv` — full per-frame record: `step, time_s, force_N,
   disp_mts_mm, n_pts, defl_mm, kappa_1pmm, na_Y_mm, profile_r2, eps_bot,
   eps_top, eps_membrane`. Level 2 appends to this same file.
-- `<DIC_DIR>/flexural_geometry.csv` — one row per coupon: `b_mm`, `d_mm`, the
+- `<DIC_DIR>/coupon_scalars.csv` — one row per coupon: `b_mm`, `d_mm`, the
   located fixture (`x_mid_mm`, `x_left_mm`, `x_right_mm`, `defl_sign`), the ROI
   and assumed face positions, `tare_mts_N`, `peak_net_N`, `frame_rate_hz`,
   `mts_offset_s`, `break_frame`, `disp_check_rmse_mm`. The only place these
-  per-coupon scalars are stored — the analogue of tensile's
-  `coupon_scalars.csv`. Upserted, so coupons skipped on a run keep their
-  existing row.
-- `<coupon_dir>/<out_filename>.csv` — Step A only, when enabled.
+  per-coupon scalars are stored. **The same file `TensileDIC_Level1.py`
+  writes** — the merge is keyed on coupon ID and the two test types never share
+  one, so each script leaves the other's rows untouched and pandas fills the
+  columns a given test type doesn't have. Upserted, so coupons skipped on a run
+  keep their existing row.
+- `<coupon_dir>/<out_filename>.csv` — Step A, one per `.out`.
 
 ---
 
 ### Level 2 — `FlexuralDIC_Level2.py`
 
-Reads Level-1's per-coupon CSV and `flexural_geometry.csv`, applies failure
+Reads Level-1's per-coupon CSV and `coupon_scalars.csv`, applies failure
 truncation, and computes the D790 properties. Cheap (pure pandas/numpy over an
 already-built CSV), so it always recomputes — re-run freely while tuning
 truncation and modulus windows.
@@ -622,27 +636,33 @@ modulus.
 
 **Inputs**
 - `<DIC_DIR>/<coupon_id>.csv` — Level-1 output.
-- `<DIC_DIR>/flexural_geometry.csv` — Level-1's per-coupon scalars.
+- `<DIC_DIR>/coupon_scalars.csv` — Level-1's per-coupon scalars.
 
 **Outputs**
 - `<DIC_DIR>/<coupon_id>.csv` — Level-1's columns, unchanged, plus `kept`,
   `stress_MPa`, `M_over_I_MPa_per_mm`, `eps_curvature`, `eps_deflection`,
   `eps_crosshead` (all toe-corrected). All `NaN` where `kept` is `False`.
-- `<DIC_DIR>/flexural_properties.csv` — one row per coupon: geometry, the four
-  moduli (tangent + chord), toe offsets, `sigma_fM_MPa`, `sigma_fB_MPa`, strain
-  at max on each channel, and the bending-quality diagnostics.
-- `<DIC_DIR>/flexural_group_stats.csv` — mean/std/count per (exposure,
-  direction).
-- **`FSR-SpecimenTesting.xlsx` is NOT written.** Whether the D790 scalars belong
-  in that workbook alongside the tensile ones, and under what column names, is
-  still undecided (see below). Until it is, `flexural_properties.csv` is the
-  single source of truth for flexural scalars — deliberately *unlike* the
-  tensile pipeline, which writes its scalars into the workbook.
+- `FSR-SpecimenTesting.xlsx` — the D790 scalars written into each coupon's row:
+  the four moduli (tangent + chord), toe offsets, `sigma_fM_MPa`,
+  `sigma_fB_MPa`, strain at max on each channel, and the bending-quality
+  diagnostics. Every header is prefixed `Flex ` so nothing is confusable with
+  the tensile columns in the same sheet; see `SPECIMEN_SHEET_COLUMNS`. The
+  workbook is the single source of truth for per-coupon scalars, exactly as it
+  is for tensile. Level-1 measurements (`b_mm`, `d_mm`, `tare_mts_N`,
+  `break_frame`, …) are deliberately *not* repeated here — they are in
+  `coupon_scalars.csv`, and a second copy could disagree with the first.
+- `<DIC_DIR>/level2_group_stats.csv` — mean/std/count per (exposure, direction),
+  under a `test` index level of `"flexural"`. **Shared with
+  `TensileDIC_Level2.py`.** That index level is load-bearing: both test types
+  have CL and IS exposures at 00 and 90, so without it a flexural `(CL, 00)` row
+  would overwrite the tensile one. Each script replaces only its own test's rows
+  and reads the other's back unchanged.
 
 ### Level 3 — not written yet
 
 There is no `FlexuralDIC_Level3.py`. Plot from `<DIC_DIR>/<coupon_id>.csv`
-(`kept == True` rows) and `flexural_properties.csv` until there is.
+(`kept == True` rows) and the `Flex …` columns of `FSR-SpecimenTesting.xlsx`
+until there is — the same two sources `TensileDIC_Level3.py` reads.
 
 ### Validation
 

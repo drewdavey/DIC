@@ -4,8 +4,8 @@ FlexuralDIC_Level2.py  —  FSR Flexural Coupons (ASTM D790, 3-point bend)
 =========================================================================
 Reads Level-1's per-coupon frame CSV, applies failure truncation, and computes
 ASTM D790 flexural properties. No plotting here — Level 3 doesn't exist yet
-(see the README); plot from the per-coupon CSV and flexural_properties.csv
-until it does.
+(see the README); plot from the per-coupon CSV and the workbook columns this
+writes until it does.
 
 Standards compliance — what each calculation cites
   Flexural stress      : D790 §12.2 Eq.3   sigma = 3PL / (2 b d^2)
@@ -70,8 +70,8 @@ PROCESSING NOTE
   span), and the DIC-derived channels are the cleanest signals in the test.
 
 INPUT per coupon
-  <DIC_DIR>/<coupon_id>.csv        Level-1's per-frame record
-  <DIC_DIR>/flexural_geometry.csv  per-coupon b, d, fixture, tare, alignment
+  <DIC_DIR>/<coupon_id>.csv       Level-1's per-frame record
+  <DIC_DIR>/coupon_scalars.csv    per-coupon b, d, fixture, tare, alignment
 
 OUTPUT per coupon
   <DIC_DIR>/<coupon_id>.csv          Level-1's columns, unchanged, plus: kept,
@@ -79,13 +79,27 @@ OUTPUT per coupon
                                      eps_curvature, eps_deflection,
                                      eps_crosshead (all toe-corrected). All NaN
                                      where kept is False.
-  <DIC_DIR>/flexural_properties.csv  one row per coupon: the D790 scalars.
-  <DIC_DIR>/flexural_group_stats.csv mean/std/count per exposure × direction.
+  FSR-SpecimenTesting.xlsx           the D790 scalars written into each coupon's
+                                     row, under the SPECIMEN_SHEET_COLUMNS
+                                     headers below.
+  <DIC_DIR>/level2_group_stats.csv   mean/std/count per exposure × direction,
+                                     under a 'test' index level of "flexural".
 
-  FSR-SpecimenTesting.xlsx is NOT written. Whether the D790 scalars belong in
-  that workbook alongside the tensile ones, and under what column names, is
-  still undecided — see the README. Until it is, the properties CSV above is
-  the single source of truth for flexural scalars.
+THE WORKBOOK IS THE SOURCE OF TRUTH, LIKE IT IS FOR TENSILE
+------------------------------------------------------------
+This used to write flexural_properties.csv and flexural_group_stats.csv, and
+this docstring used to record that whether the D790 scalars belonged in
+FSR-SpecimenTesting.xlsx was undecided. It is decided: they go in the workbook,
+under flexural-specific column headers, exactly as TensileDIC_Level2 writes the
+D638 scalars into the same sheet. Tensile and flexural coupons are different
+rows of that sheet, so the two never collide, and there is now one place to read
+any coupon's properties from.
+
+Group statistics go into level2_group_stats.csv, the file TensileDIC_Level2
+writes, under an added 'test' index level. That level is load-bearing, not
+decoration: both test types have CL and IS exposures at 00 and 90, so without it
+a flexural (CL, 00) row would overwrite the tensile one. Each script replaces
+only its own test's rows and leaves the other's alone.
 """
 
 from __future__ import annotations
@@ -96,6 +110,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import openpyxl
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -106,6 +121,10 @@ DIC_DIR = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\DIC"
+)
+SPECIMEN_SHEET = Path(
+    r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
+    r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.xlsx"
 )
 
 # =============================================================================
@@ -125,6 +144,56 @@ REPLICATES = ["01", "02", "03"]
 # =============================================================================
 IN2MM        = 25.4
 FLEX_SPAN_MM = 8.00 * IN2MM
+
+# =============================================================================
+# Scalar property columns written into SPECIMEN_SHEET, keyed by coupon
+# ("Specimen ID") — maps the property dict key to the Excel column header.
+#
+# Every header is prefixed "Flex " so nothing here can be confused with the
+# tensile columns TensileDIC_Level2 writes into the same sheet. The two test
+# types occupy different rows, so the prefix is for the reader, not to avoid a
+# collision.
+#
+# What is NOT here: b_mm, d_mm, span_mm, I_mm4, span_to_depth, tare_mts_N,
+# frame_rate_hz, mts_offset_s, break_frame, disp_check_rmse_mm and n_frames.
+# Those are Level-1 measurements or trivially derived from them, and they live
+# in coupon_scalars.csv — writing them here too would create a second copy that
+# could disagree with the first.
+# =============================================================================
+SPECIMEN_SHEET_COLUMNS = {
+    # --- headline D790 results ---
+    "sigma_fM_MPa":             "Flex Strength (MPa)",
+    "sigma_fB_MPa":             "Flex Stress at Break (MPa)",
+    "broke_before_5pct":        "Flex Broke Before 5% Strain",
+    "P_max_N":                  "Flex Peak Load (N)",
+    # --- modulus, per strain channel (curvature is the reference) ---
+    "Ef_curvature_GPa":         "Flex Ef curvature (GPa)",
+    "Ef_curvature_chord_GPa":   "Flex Ef curvature chord (GPa)",
+    "eps_at_max_curvature":     "Flex Strain at Max (curvature)",
+    "toe_curvature":            "Flex Toe Strain (curvature)",
+    "Ef_deflection_GPa":        "Flex Ef deflection (GPa)",
+    "Ef_deflection_chord_GPa":  "Flex Ef deflection chord (GPa)",
+    "eps_at_max_deflection":    "Flex Strain at Max (deflection)",
+    "toe_deflection":           "Flex Toe Strain (deflection)",
+    "Ef_crosshead_GPa":         "Flex Ef crosshead (GPa)",
+    "Ef_crosshead_chord_GPa":   "Flex Ef crosshead chord (GPa)",
+    "eps_at_max_crosshead":     "Flex Strain at Max (crosshead)",
+    "toe_crosshead":            "Flex Toe Strain (crosshead)",
+    "Ef_MI_kappa_GPa":          "Flex Ef M/I-kappa (GPa)",
+    # --- quality diagnostics: whether the bending assumptions held ---
+    "profile_r2_median":        "Flex Profile R2 (median)",
+    "profile_r2_at_max":        "Flex Profile R2 (at max)",
+    "na_offset_at_max_mm":      "Flex NA Offset at Max (mm)",
+    "na_offset_at_low_load_mm": "Flex NA Offset at Low Load (mm)",
+    "na_drift_mm":              "Flex NA Drift (mm)",
+    "eps_membrane_at_max":      "Flex Membrane Strain at Max",
+    "defl_over_span_at_max":    "Flex Deflection/Span at Max",
+    "n_kept":                   "Flex Frames Kept",
+    "n_fit_curvature":          "Flex Modulus Fit Points (curvature)",
+    "n_fit_deflection":         "Flex Modulus Fit Points (deflection)",
+    "n_fit_crosshead":          "Flex Modulus Fit Points (crosshead)",
+    "n_fit_MI_kappa":           "Flex Modulus Fit Points (M/I-kappa)",
+}
 
 # =============================================================================
 # FAILURE TRUNCATION  — mirrors TensileDIC_Level2's, plus a DIC-validity term
@@ -164,13 +233,149 @@ def find_frames_csv(cid):
     p = DIC_DIR / f"{cid}.csv"
     return p if p.exists() else None
 
-def load_geometry() -> pd.DataFrame:
-    """flexural_geometry.csv, indexed by coupon — b, d, fixture, tare and
-    alignment, written once per coupon by Level 1."""
-    fp = DIC_DIR / "flexural_geometry.csv"
+def load_coupon_scalars() -> pd.DataFrame:
+    """coupon_scalars.csv, indexed by coupon — b, d, fixture, tare and
+    alignment, written once per coupon by Level 1.
+
+    Shared with the tensile pipeline, so this table also holds tensile rows
+    carrying entirely different columns. Only flexural coupon IDs are looked up
+    here, so those rows are never touched."""
+    fp = DIC_DIR / "coupon_scalars.csv"
     if not fp.exists():
         return pd.DataFrame()
     return pd.read_csv(fp).set_index("coupon")
+
+
+def write_specimen_sheet(rows: list[dict]) -> None:
+    """Write each coupon's D790 scalars into its row in SPECIMEN_SHEET, matched
+    by Specimen ID. Adds any missing property columns at the end; everything
+    else in the workbook (other rows, formulas, formatting) is left untouched.
+    Skipped with a warning if the file can't be opened — e.g. open in Excel.
+
+    Same routine as TensileDIC_Level2.write_specimen_sheet, against the same
+    workbook but a disjoint set of rows and column headers.
+    """
+    try:
+        wb = openpyxl.load_workbook(SPECIMEN_SHEET)
+    except FileNotFoundError:
+        print(f"[!] {SPECIMEN_SHEET} not found — skipping specimen sheet update")
+        return
+    ws = wb.active
+
+    header = {ws.cell(row=1, column=c).value: c for c in range(1, ws.max_column + 1)}
+    id_col = header.get("Specimen ID")
+    if id_col is None:
+        print("[!] 'Specimen ID' column not found in specimen sheet — skipping update")
+        return
+
+    next_col = ws.max_column + 1
+    for label in SPECIMEN_SHEET_COLUMNS.values():
+        if label not in header:
+            ws.cell(row=1, column=next_col, value=label)
+            header[label] = next_col
+            next_col += 1
+
+    row_by_id = {ws.cell(row=r, column=id_col).value: r
+                 for r in range(2, ws.max_row + 1)}
+
+    n_written = 0
+    for row in rows:
+        r = row_by_id.get(row["coupon"])
+        if r is None:
+            print(f"[!] {row['coupon']} has no row in the specimen sheet — "
+                  f"its properties were not written")
+            continue
+        for key, label in SPECIMEN_SHEET_COLUMNS.items():
+            v = row.get(key)
+            # bools (broke_before_5pct) are written through as-is; np.isfinite
+            # would reject them, and None is how a blank cell is spelled.
+            if isinstance(v, (bool, np.bool_)):
+                v = bool(v)
+            elif v is None or not np.isfinite(v):
+                v = None
+            else:
+                v = float(v)
+            ws.cell(row=r, column=header[label], value=v)
+        n_written += 1
+
+    # openpyxl doesn't evaluate formulas, so re-saving drops the cached values
+    # of every formula cell in the workbook (e.g. Width/Dia, Computed Area)
+    # until something recalculates them. Force a full recalculation on next
+    # open so they never appear blank.
+    wb.calculation.fullCalcOnLoad = True
+    try:
+        wb.save(SPECIMEN_SHEET)
+        print(f"Specimen sheet: {n_written} coupon(s) → {SPECIMEN_SHEET.name}")
+    except PermissionError:
+        print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
+
+
+def read_existing_group_stats(fp: Path) -> pd.DataFrame | None:
+    """Read level2_group_stats.csv, upgrading the pre-'test' two-level layout.
+
+    The index depth has to be READ, not assumed. pandas writes a named
+    MultiIndex as a third header line holding the level names, so that line says
+    how many index columns the file on disk really has — and reading a
+    two-level file with index_col=[0,1,2] does not raise. It quietly swallows
+    the first data column into the index and shifts every value one place left,
+    which looks like a successful merge and silently corrupts the other test
+    type's rows.
+
+    Returns None if the file can't be understood, so the caller can say so
+    rather than write a half-merged table.
+    """
+    try:
+        with open(fp, encoding="utf-8") as fh:
+            head = [fh.readline() for _ in range(3)]
+        names = [c.strip() for c in head[2].rstrip(chr(13) + chr(10)).split(",") if c.strip()]
+        if not names:
+            return None
+        old = pd.read_csv(fp, header=[0, 1], index_col=list(range(len(names))))
+        if "test" not in names:
+            # Written before the 'test' level existed, when only the tensile
+            # pipeline wrote this file. Everything in it is tensile.
+            old = pd.concat({"tensile": old}, names=["test"])
+        # A direction of "00" round-trips through read_csv as the integer 0, so
+        # normalise every level back to the string form both scripts write.
+        old.index = pd.MultiIndex.from_tuples(
+            [(str(t), str(e), f"{int(d):02d}" if str(d).strip().isdigit() else str(d))
+             for t, e, d in old.index],
+            names=["test", "exposure", "direction"])
+        return old
+    except Exception:
+        return None
+
+
+def write_group_stats(rows: list[dict]) -> Path:
+    """Upsert this run's group statistics into level2_group_stats.csv.
+
+    The file is shared with TensileDIC_Level2 and indexed by
+    (test, exposure, direction). Both test types have CL and IS exposures at 00
+    and 90, so without the 'test' level the flexural rows would land on top of
+    the tensile ones. Only rows whose test == "flexural" are replaced; anything
+    else already in the file is read back and written out unchanged.
+    """
+    fp = DIC_DIR / "level2_group_stats.csv"
+    df_sum = pd.DataFrame(rows)
+    df_sum["test"] = "flexural"
+    df_sum["exposure"] = df_sum["coupon"].map(lambda c: parse_id(c)[0])
+    df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
+    agg_cols = ["sigma_fM_MPa", "Ef_curvature_GPa", "Ef_deflection_GPa",
+                "Ef_crosshead_GPa", "eps_at_max_curvature", "P_max_N"]
+    group = (df_sum.groupby(["test", "exposure", "direction"])[agg_cols]
+                   .agg(["mean", "std", "count"]))
+
+    if fp.exists():
+        old = read_existing_group_stats(fp)
+        if old is None:
+            print(f"[!] could not read existing {fp.name} — it is being replaced "
+                  f"with flexural rows only.\n    Re-run TensileDIC_Level2.py to "
+                  f"put the tensile rows back.")
+        else:
+            old = old.drop(index="flexural", level=0, errors="ignore")
+            group = pd.concat([old, group]).sort_index()
+    group.to_csv(fp)
+    return fp
 
 
 def truncation_mask(force: np.ndarray, has_dic: np.ndarray) -> np.ndarray:
@@ -388,9 +593,9 @@ def main() -> None:
           f"confirmed fixture setting, D790 nominal")
     print()
 
-    geometry = load_geometry()
-    if geometry.empty:
-        print("[!] no flexural_geometry.csv — run FlexuralDIC_Level1 first")
+    scalars = load_coupon_scalars()
+    if scalars.empty:
+        print("[!] no coupon_scalars.csv — run FlexuralDIC_Level1 first")
         return
 
     rows = []
@@ -399,12 +604,12 @@ def main() -> None:
         if frames_fp is None:
             print(f"[{cid}] no per-coupon CSV — run Level 1 first")
             continue
-        if cid not in geometry.index:
-            print(f"[{cid}] not in flexural_geometry.csv — re-run Level 1 for it")
+        if cid not in scalars.index:
+            print(f"[{cid}] not in coupon_scalars.csv — re-run Level 1 for it")
             continue
 
         frames = pd.read_csv(frames_fp)
-        result = compute_properties(cid, frames, geometry.loc[cid])
+        result = compute_properties(cid, frames, scalars.loc[cid])
         if result is None:
             continue
         frames, props = result
@@ -416,21 +621,14 @@ def main() -> None:
         rows.append(props)
 
     if rows:
-        prop_fp = DIC_DIR / "flexural_properties.csv"
-        pd.DataFrame(rows).to_csv(prop_fp, index=False, float_format="%.6g")
+        write_specimen_sheet(rows)
 
         # ---- mean & std per (exposure, direction), as D638 §11.7 does for
         # tensile. D790 §12.9 asks for the same summary statistics.
-        df_sum = pd.DataFrame(rows)
-        df_sum["exposure"] = df_sum["coupon"].map(lambda c: parse_id(c)[0])
-        df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
-        agg_cols = ["sigma_fM_MPa", "Ef_curvature_GPa", "Ef_deflection_GPa",
-                    "Ef_crosshead_GPa", "eps_at_max_curvature", "P_max_N"]
-        stats_fp = DIC_DIR / "flexural_group_stats.csv"
-        (df_sum.groupby(["exposure", "direction"])[agg_cols]
-               .agg(["mean", "std", "count"]).to_csv(stats_fp))
+        stats_fp = write_group_stats(rows)
 
-        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {prop_fp.name}, {stats_fp.name}")
+        print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
+              f"DIC/{stats_fp.name}")
 
     print(f"\nDone. {time.time() - t0:.1f} s")
 

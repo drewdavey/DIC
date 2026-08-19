@@ -274,6 +274,77 @@ def write_specimen_sheet(rows: list[dict]) -> None:
     except PermissionError:
         print(f"[!] {SPECIMEN_SHEET} is open elsewhere — could not save properties to it")
 
+def read_existing_group_stats(fp: Path) -> pd.DataFrame | None:
+    """Read level2_group_stats.csv, upgrading the pre-'test' two-level layout.
+
+    The index depth has to be READ, not assumed. pandas writes a named
+    MultiIndex as a third header line holding the level names, so that line says
+    how many index columns the file on disk really has — and reading a
+    two-level file with index_col=[0,1,2] does not raise. It quietly swallows
+    the first data column into the index and shifts every value one place left,
+    which looks like a successful merge and silently corrupts the other test
+    type's rows.
+
+    Returns None if the file can't be understood, so the caller can say so
+    rather than write a half-merged table.
+    """
+    try:
+        with open(fp, encoding="utf-8") as fh:
+            head = [fh.readline() for _ in range(3)]
+        names = [c.strip() for c in head[2].rstrip(chr(13) + chr(10)).split(",") if c.strip()]
+        if not names:
+            return None
+        old = pd.read_csv(fp, header=[0, 1], index_col=list(range(len(names))))
+        if "test" not in names:
+            # Written before the 'test' level existed, when only the tensile
+            # pipeline wrote this file. Everything in it is tensile.
+            old = pd.concat({"tensile": old}, names=["test"])
+        # A direction of "00" round-trips through read_csv as the integer 0, so
+        # normalise every level back to the string form both scripts write.
+        old.index = pd.MultiIndex.from_tuples(
+            [(str(t), str(e), f"{int(d):02d}" if str(d).strip().isdigit() else str(d))
+             for t, e, d in old.index],
+            names=["test", "exposure", "direction"])
+        return old
+    except Exception:
+        return None
+
+
+def write_group_stats(rows: list[dict]) -> Path:
+    """Upsert this run's group statistics into level2_group_stats.csv.
+
+    The file is shared with FlexuralDIC_Level2 and indexed by
+    (test, exposure, direction). Both test types have CL and IS exposures at 00
+    and 90, so without the 'test' level the flexural rows and the tensile ones
+    would land on top of each other. Only rows whose test == "tensile" are
+    replaced; anything else already in the file is read back and written out
+    unchanged.
+    """
+    fp = DIC_DIR / "level2_group_stats.csv"
+    df_sum = pd.DataFrame(rows)
+    df_sum["test"] = "tensile"
+    df_sum["exposure"]  = df_sum["coupon"].map(lambda c: parse_id(c)[0])
+    df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
+    agg_cols = ["E_GPa", "sigma_y_MPa", "UTS_MPa", "eps_at_UTS", "poisson_chord"]
+    group = (df_sum.groupby(["test", "exposure", "direction"])[agg_cols]
+                   .agg(["mean", "std", "count"]))
+
+    if fp.exists():
+        try:
+            old = pd.read_csv(fp, header=[0, 1], index_col=[0, 1, 2])
+            old = old.drop(index="tensile", level=0, errors="ignore")
+            group = pd.concat([old, group]).sort_index()
+        except Exception as ex:
+            # An older two-level file, written before the 'test' level existed,
+            # can't be merged column-wise. Say so rather than silently dropping
+            # it; re-running FlexuralDIC_Level2 restores the flexural rows.
+            print(f"[!] could not merge existing {fp.name} ({ex}) — it is being "
+                  f"replaced with tensile rows only.\n    Re-run "
+                  f"FlexuralDIC_Level2.py to put the flexural rows back.")
+    group.to_csv(fp)
+    return fp
+
+
 def truncation_mask(force_N: np.ndarray) -> np.ndarray:
     """Boolean mask, same length as force_N, selecting the valid test
     window: pre-load slack and post-fracture rebound are False."""
@@ -490,13 +561,7 @@ def main():
         write_specimen_sheet(rows)
 
         # ---- D638 §11.7 / §12.1: mean & std per (exposure, direction) -------
-        df_sum = pd.DataFrame(rows)
-        df_sum["exposure"]  = df_sum["coupon"].map(lambda c: parse_id(c)[0])
-        df_sum["direction"] = df_sum["coupon"].map(lambda c: parse_id(c)[1])
-        agg_cols = ["E_GPa", "sigma_y_MPa", "UTS_MPa", "eps_at_UTS", "poisson_chord"]
-        group = (df_sum.groupby(["exposure", "direction"])[agg_cols]
-                       .agg(["mean", "std", "count"]))
-        group.to_csv(DIC_DIR / "level2_group_stats.csv")
+        write_group_stats(rows)
 
         print(f"\n{len(rows)} coupon(s) → DIC/*.csv, {SPECIMEN_SHEET.name}, "
               f"DIC/level2_group_stats.csv")

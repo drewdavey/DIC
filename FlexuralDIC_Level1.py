@@ -3,8 +3,8 @@
 FlexuralDIC_Level1.py  —  FSR Flexural Coupons (ASTM D790, 3-point bend)
 =========================================================================
 Step A — exports each coupon's raw VIC-3D .out files to per-frame CSVs
-(next to the .out files, on the raw data drive). Off by default: nothing
-downstream reads them and it is ~1 GB per coupon.
+(next to the .out files, on the raw data drive), exactly as TensileDIC_Level1
+Step A does and with the same columns. ~1 GB per coupon.
 Step B — reduces every .out frame to the bending kinematics (midspan
 deflection, curvature, neutral axis, extreme-fibre strains), pairs them with
 the MTS force/displacement record, and writes one per-coupon CSV (full,
@@ -124,16 +124,28 @@ INPUT per coupon
   FSR-SpecimenTesting.xlsx      depth d and width b (read only, never written)
 
 OUTPUTS
-  <coupon_dir>/<out_filename>.csv   Step A only: one CSV per .out, next to it
+  <coupon_dir>/<out_filename>.csv   Step A: one CSV per .out, written next to
+                                    it, same EXPORT_VARS columns TensileDIC_
+                                    Level1 writes.
   <DIC_DIR>/<coupon_id>.csv         full per-frame record: step, time_s,
                                     force_N, disp_mts_mm, n_pts, defl_mm,
                                     kappa_1pmm, na_Y_mm, profile_r2, eps_bot,
                                     eps_top, eps_membrane. Level 2 reads this
                                     same file and appends its own columns.
-  <DIC_DIR>/flexural_geometry.csv   one row per coupon: b, d, the located
+  <DIC_DIR>/coupon_scalars.csv      one row per coupon: b, d, the located
                                     fixture, the tare, the alignment offset
                                     and its cross-check. The only place these
                                     per-coupon scalars are stored.
+
+ONE FILE LAYOUT FOR BOTH TEST TYPES
+-----------------------------------
+This script used to write its per-coupon scalars to a flexural_geometry.csv of
+its own. It no longer does: they go into <DIC_DIR>/coupon_scalars.csv, the same
+file TensileDIC_Level1 writes, keyed by coupon. The two test types contribute
+different columns — tensile mts_peak_N and area_mm2, flexural the fixture and
+alignment block — so the table is sparse, and that is the point: one place to
+look up any coupon's scalars, tensile or flexural, instead of one file per test
+type. The upsert is by coupon ID, so neither script disturbs the other's rows.
 """
 
 from __future__ import annotations
@@ -172,7 +184,7 @@ DIRECTIONS = {"00": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
 DO_LIST_VARS     = True     # Step C: report the variables in each coupon's .out files
-DO_EXPORT_FRAMES = False    # Step A: dump each .out to a CSV next to it (~1 GB/coupon)
+DO_EXPORT_FRAMES = True     # Step A: dump each .out to a CSV next to it (~1 GB/coupon)
 OVERWRITE_FRAMES = False    # if False, skip .out files whose .csv already exists
 DO_BUILD_L1      = True     # Step B: reduce frames + pair with MTS
 OVERWRITE_L1     = False    # if False, skip coupons whose per-coupon CSV already exists
@@ -185,9 +197,24 @@ OVERWRITE_L1     = False    # if False, skip coupons whose per-coupon CSV alread
 # any new VIC-3D inspector items land once the projects are reprocessed, so
 # adding one here costs nothing on coupons that predate it. Step C prints what
 # each coupon actually has; check there first after a reprocess.
+#
+# EXPORT_VARS is a separate, wider list used only by Step A. Step B needs five
+# variables; the per-frame CSVs are a general-purpose export that other tools
+# read, so they carry everything the .out has — the same list TensileDIC_Level1
+# exports, so a flexural per-frame CSV and a tensile one have the same columns.
 # =============================================================================
 REQUIRED_VARS = ["sigma", "X", "Y", "V", "exx"]
 OPTIONAL_VARS = ["Z", "U", "W", "eyy", "exy"]
+
+EXPORT_VARS = [
+    "sigma",                              # correlation confidence (filter on this)
+    "X", "Y", "Z",                        # world coords (mm)
+    "U", "V", "W",                        # displacements (mm)
+    "exx", "eyy", "exy",                  # in-plane strains
+    "e1", "e2", "gamma",                  # principal & max-shear strains
+    "x", "y", "u", "v",                   # pixel coords / pixel disps
+    "q", "r", "q_ref", "r_ref",           # subset coords
+]
 
 # =============================================================================
 # FIXTURE / SPECIMEN GEOMETRY
@@ -667,11 +694,57 @@ def midspan_strain_fit(df: pd.DataFrame, x_mid: float,
 # =============================================================================
 # STEP A — .out → per-frame CSV
 # =============================================================================
-def export_frames(cid: str, cdir: Path) -> None:
-    """Dump every .out to a sibling CSV, the way TensileDIC_Level1 Step A does.
+def export_out_to_csv(out_path: Path, csv_path: Path,
+                      var_names: list[str]) -> bool:
+    """Convert a single .out to CSV. Byte-for-byte the same routine as
+    TensileDIC_Level1.export_out_to_csv, so the two test types produce
+    interchangeable per-frame CSVs.
 
-    Off by default: Step B holds each frame in memory anyway, so nothing here
-    reads these files, and they are ~1 GB per coupon.
+    Writes one row per valid AOI point, columns named after var_names, with
+    sigma used to filter invalid points and then dropped from the output.
+    Returns True on success.
+    """
+    ds = VICDataSet()
+    try:
+        ds.load(str(out_path))
+    except Exception as ex:
+        print(f"    [!] could not load {out_path.name}: {ex}")
+        return False
+
+    try:
+        available = list(ds.variables())
+    except Exception:
+        available = []
+    wanted = [v for v in var_names if (not available) or (v in available)]
+    if not wanted:
+        print(f"    [!] none of the requested variables found in {out_path.name}")
+        return False
+    try:
+        values = ds.get_values(wanted)
+    except Exception as ex:
+        print(f"    [!] get_values failed on {out_path.name}: {ex}")
+        return False
+
+    mask = np.ones(len(values), dtype=bool)
+    if "sigma" in values.dtype.names:
+        mask &= values["sigma"] >= 0
+
+    export_cols = [v for v in wanted if v != "sigma"]
+    with open(csv_path, "w", encoding="utf-8") as fh:
+        fh.write(",".join(export_cols) + "\n")
+        arrs = [np.asarray(values[v])[mask] for v in export_cols]
+        for row in zip(*arrs):
+            fh.write(",".join(f"{x}" for x in row) + "\n")
+    return True
+
+
+def export_frames(cid: str, cdir: Path) -> None:
+    """Step A for one coupon: export every .out to a sibling CSV.
+
+    Costs ~1 GB per coupon and Step B does not read these — it loads each .out
+    itself. They exist so the flexural raw data is laid out exactly like the
+    tensile raw data, and so anything that wants a frame (the heatmap animation,
+    an ad-hoc look at one frame) can read a CSV instead of needing vicpyx.
     """
     out_files = find_out_files(cdir)
     if not out_files:
@@ -683,11 +756,8 @@ def export_frames(cid: str, cdir: Path) -> None:
         if csv_fp.exists() and not OVERWRITE_FRAMES:
             n_skipped += 1
             continue
-        df = read_frame(fp)
-        if df is None:
-            continue
-        df.to_csv(csv_fp, index=False, float_format="%.6g")
-        n_written += 1
+        if export_out_to_csv(fp, csv_fp, EXPORT_VARS):
+            n_written += 1
     print(f"  Step A: {len(out_files)} .out files, wrote {n_written}, "
           f"skipped {n_skipped} (already existed)")
 
@@ -696,7 +766,7 @@ def export_frames(cid: str, cdir: Path) -> None:
 # STEP B — reduce frames + pair with MTS, write the per-coupon CSV
 # =============================================================================
 def build_l1(cid: str, cdir: Path) -> dict | None:
-    """Step B for one coupon. Returns its geometry row, or None if skipped."""
+    """Step B for one coupon. Returns its coupon_scalars row, or None if skipped."""
     DIC_DIR.mkdir(parents=True, exist_ok=True)
     out_fp = DIC_DIR / f"{cid}.csv"
     if out_fp.exists() and not OVERWRITE_L1:
@@ -925,12 +995,19 @@ def process_coupon(cid: str) -> dict | None:
     return None
 
 
-def write_geometry(rows: list[dict]) -> Path:
-    """Upsert this run's per-coupon geometry rows into flexural_geometry.csv —
-    the single place these scalars are stored, so they are never repeated down
-    every row of a per-frame CSV. Coupons skipped this run keep whatever row is
-    already on disk from a previous run."""
-    out_fp = DIC_DIR / "flexural_geometry.csv"
+def write_coupon_scalars(rows: list[dict]) -> Path:
+    """Upsert this run's per-coupon scalars into coupon_scalars.csv — the single
+    place these are stored, so they are never repeated down every row of a
+    per-frame CSV. Coupons skipped this run keep whatever row is already on disk
+    from a previous run.
+
+    The same file TensileDIC_Level1 writes. The merge is keyed on coupon ID and
+    the two test types never share an ID, so tensile rows pass through this
+    function untouched and keep their own columns; pandas fills the columns each
+    test type does not have. Identical routine to
+    TensileDIC_Level1.write_coupon_scalars — either script can be run first.
+    """
+    out_fp = DIC_DIR / "coupon_scalars.csv"
     DIC_DIR.mkdir(parents=True, exist_ok=True)
     merged = {}
     if out_fp.exists():
@@ -940,7 +1017,7 @@ def write_geometry(rows: list[dict]) -> Path:
         merged[row["coupon"]] = row
     pd.DataFrame(sorted(merged.values(), key=lambda r: r["coupon"])
                 ).to_csv(out_fp, index=False, float_format="%.6g")
-    print(f"Geometry: {out_fp}")
+    print(f"Coupon scalars: {out_fp}")
     return out_fp
 
 
@@ -957,21 +1034,21 @@ def main() -> None:
     coupons = selected_coupons()
     print(f"Processing {len(coupons)} coupon(s)\n")
 
-    geom_rows = []
+    scalar_rows = []
     for i, cid in enumerate(coupons, start=1):
         t_c = time.time()
         try:
             row = process_coupon(cid)
             if row is not None:
-                geom_rows.append(row)
+                scalar_rows.append(row)
         except Exception as ex:
             print(f"  [error] {cid}: {ex}")
         elapsed = time.time() - t0
         print(f"  [{i}/{len(coupons)}] {time.time() - t_c:.1f} s this coupon | "
               f"elapsed {elapsed:.1f} s | ETA {elapsed / i * (len(coupons) - i):.1f} s\n")
 
-    if geom_rows:
-        write_geometry(geom_rows)
+    if scalar_rows:
+        write_coupon_scalars(scalar_rows)
 
     print(f"Done. {time.time() - t0:.1f} s")
 
