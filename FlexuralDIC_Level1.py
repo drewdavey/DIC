@@ -85,7 +85,7 @@ The flexural records open on a constant ~860 N held through the approach
 travel: the loading nose hanging on an un-tared cell. It shows on all 12
 flexural specimens in both orientations, and left in it inflates flexural
 strength ~1.6x. find_force_baseline() detects and removes it (ported from
-mts_quick_plots.py). Tensile and bearing records don't have it.
+mts_plots.py). Tensile and bearing records don't have it.
 
 SPAN
 ----
@@ -433,7 +433,7 @@ def find_break_frame(out_files: list[Path]) -> int:
 def find_force_baseline(d: np.ndarray, f: np.ndarray) -> float:
     """Level of the leading flat run in `f`, or 0.0 if there isn't one.
 
-    Same detector as mts_quick_plots.find_force_baseline. The flexural records
+    Same detector as mts_plots.find_force_baseline. The flexural records
     open on a constant ~862 +/- 3 N holding over ~1.6 mm of crosshead travel,
     against loading slopes of ~164 N/mm (0 deg) and ~85 N/mm (90 deg): force
     cannot stay constant while the crosshead advances, and the same level shows

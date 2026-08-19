@@ -499,7 +499,7 @@ residual would be a loud signal that the two files are not the same test.
 the approach travel — the loading nose hanging on an un-tared cell. It shows on
 all 12 flexural specimens in both orientations, and left in it inflates flexural
 strength ~1.6×. `find_force_baseline()` detects and removes it (ported from
-`mts_quick_plots.py`). Tensile and bearing records don't have it.
+`mts_plots.py`). Tensile and bearing records don't have it.
 
 **ROI orientation check — three coupons are blocked on it.** Every reduction in
 this script assumes the VIC-3D world frame is oriented the same way on every
@@ -717,15 +717,44 @@ MTS ramp slopes and the tensile workbook give for that orientation.
 
 ## Outside the pipelines
 
-`mts_quick_plots.py` is a standalone first-look script — MTS channels only, no
-DIC, no property extraction. It plots force–displacement and stress–strain for
-all three test types (one figure each, colour by exposure, linestyle by
-orientation) straight from the raw `.txt` files plus the geometry columns in
-`FSR-SpecimenTesting.xlsx`. Use it to eyeball a batch; use the levelled
-pipelines for anything quotable. It is where the flexural load-cell tare was first
-documented, and it detects and removes the tare itself (`find_force_baseline`,
-with `--keep-tare` to disable). Its notes still describe the 8.00 in span as an
-assumption — that is now confirmed.
+`mts_plots.py` (renamed from `mts_quick_plots.py`) is a standalone first-look
+script — MTS channels only, no DIC, no property extraction. It plots
+force–displacement and stress–strain for all three test types (one figure each,
+colour by exposure, linestyle by orientation) straight from the raw `.txt` files
+plus the geometry columns in the specimen sheet. Use it to eyeball a batch; use
+the levelled pipelines for anything quotable.
+
+- **Geometry input** — it reads `FSR-SpecimenTesting.csv`, the CSV export kept
+  alongside `FSR-SpecimenTesting.xlsx` under the same stem, and falls back to
+  the `.xlsx` if the CSV is missing or unreadable. The CSV needs no Excel engine
+  and is not locked while the workbook is open. It is a Windows export, so it is
+  cp1252, not UTF-8 — the reader tries `utf-8-sig`, `cp1252`, `latin-1` in turn.
+- **ASTM reductions** — every formula it applies is written out in full, with
+  its source, in the `ASTM EQUATIONS` block at the top of the file: D638 §11.2
+  σ = P/A₀ and Annex A1 toe compensation; D790 §12.2 Eq.3 σ_f = 3PL/2bd²,
+  §12.3 Eq.4 ε_f = 6Dd/L², and the §12.3 large-support-span stress correction
+  (`--large-deflection`, off by default — this fixture is 16:1 and D/L peaks at
+  0.067, below the 0.10 threshold, and it prints max D/L on every run);
+  D953 §13.2 σ_b = P/(D·t) on the projected area with the §13.3 4 % hole
+  deformation ordinate drawn on the panel.
+- **Toe compensation** follows D638 Annex A1.3 literally — the *steepest*
+  straight segment of the load–deflection record, searched between 5 % and 60 %
+  of peak load, extrapolated to zero load. That agrees with the fixed 10–40 %
+  window it used before to within 0.02–0.12 mm on every P01 coupon.
+- **The tensile right-hand axis is not a D638 strain** and is labelled as such.
+  D638 §3.2.5 nominal strain is referred to the original *grip separation*,
+  which was never recorded for this batch, so crosshead travel is divided by the
+  DIC axial gauge length (4.36 in) instead, purely so the axis is on the same
+  scale as the DIC record. Fill in `TENSILE_GRIP_SEPARATION_MM` if it is ever
+  measured and the panel becomes a true D638 nominal strain.
+- It is where the flexural load-cell tare was first documented, and it detects
+  and removes the tare itself (`find_force_baseline`, with `--keep-tare` to
+  disable). Tare removal runs *before* the toe fit, since a constant offset
+  moves the Hookean line's zero-load intercept.
+- Outputs are `figs/mts_tensile.png`, `figs/mts_flexural.png`,
+  `figs/mts_bearing.png` (was `mts_quick_*.png`), plus a per-specimen stdout
+  table carrying the ASTM validity flags: D790 §12.2's 5 % strain rule, D790
+  §12.3's D/L threshold, and D953 §13.3's 4 % deformation.
 
 `matlab/tensile_plots.m` and `matlab/bearing_plots.m` are an independent MATLAB
 re-implementation of part of tensile Level 3's plotting, kept for reference;
