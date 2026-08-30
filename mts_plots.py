@@ -65,6 +65,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 # =============================================================================
+<<<<<<< HEAD
 # SCALAR PARAMETERS
 #
 # Every number this script can be tuned by, gathered in one place so nothing
@@ -122,6 +123,8 @@ TOE_WINDOW_MIN_PTS   = 25             # never fit a window shorter than this
 
 
 # =============================================================================
+=======
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 # ASTM EQUATIONS
 #
 # Written out here once, in the standards' own symbols, so the reductions
@@ -152,11 +155,17 @@ TOE_WINDOW_MIN_PTS   = 25             # never fit a window shorter than this
 #             eps_nom = (change in grip separation) / (original grip separation)
 #
 #          D638's crosshead-based strain is referred to the ORIGINAL GRIP
+<<<<<<< HEAD
 #          SEPARATION, measured at 9.00 in for this batch — see
 #          TENSILE_GRIP_SEPARATION_IN in SCALAR PARAMETERS above. The
 #          right-hand tensile axis is therefore a D638 nominal strain, but it
 #          is still crosshead travel and so carries grip slip and load-frame
 #          compliance; a D638 §11.4 strain needs the extensometer/DIC record.
+=======
+#          SEPARATION, which was not recorded for this batch. See
+#          TENSILE_REF_LENGTH_MM below for what is used instead and why the
+#          right-hand tensile axis is therefore not a D638 strain.
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 #
 #   Annex A1 (A1.2/A1.3)  Toe compensation
 #
@@ -236,24 +245,79 @@ TOE_WINDOW_MIN_PTS   = 25             # never fit a window shorter than this
 # ---------------------------------------------------------------------------
 # Paths
 #
+<<<<<<< HEAD
 # The specimen geometry lives in FSR-SpecimenTesting.csv one level above the
 # coupon folders. It used to be an .xlsx with a CSV export beside it; the
 # workbook is retired (its formula columns kept coming back blank once a Level
 # 2 had saved it through openpyxl), so the CSV is now the sheet itself — read
 # here, and written by the Level 2s.
+=======
+# The specimen geometry lives in FSR-SpecimenTesting.xlsx one level above the
+# coupon folders. A CSV export of the same sheet is kept alongside it under the
+# same stem; the CSV is preferred because reading it needs no Excel engine, and
+# the .xlsx is the fallback. Both carry identical column headers.
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 # ---------------------------------------------------------------------------
 SCRIPT_DIR     = Path(__file__).resolve().parent
 COUPONS_ROOT   = SCRIPT_DIR.parent
 SPECIMEN_STEM  = COUPONS_ROOT.parent / "FSR-SpecimenTesting"
 SPECIMEN_CSV   = SPECIMEN_STEM.with_suffix(".csv")
+<<<<<<< HEAD
 
 # The CSV started life as a Windows Excel export, so its degree/superscript
 # characters ("Computed Area (in^2)") may still be cp1252 rather than UTF-8.
 # Try in this order; the Level 2s re-write the file as utf-8-sig.
+=======
+SPECIMEN_XLSX  = SPECIMEN_STEM.with_suffix(".xlsx")
+
+# The CSV is exported from Excel on Windows, so its degree/superscript
+# characters ("Computed Area (in^2)") are cp1252, not UTF-8. Try in this order.
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 
 # ---------------------------------------------------------------------------
+<<<<<<< HEAD
+=======
+# Test geometry
+# ---------------------------------------------------------------------------
+# FLEX_SPAN_MM — support span L of the 3-point bend fixture. CONFIRMED at
+#   8.00 in against the fixture, which is D790 §7.2's 16:1 span-to-depth for the
+#   nominal 0.50 in coupon depth. Must match FLEX_SPAN_MM in FlexuralDIC_Level1.py
+#   and FlexuralDIC_Level2.py; if you ever change it, change it in all three.
+FLEX_SPAN_MM = 8.00 * IN2MM                 # L = 203.2 mm
+
+# TENSILE_REF_LENGTH_MM — the length the tensile crosshead travel is divided by
+#   to make the right-hand panel's abscissa.
+#
+#   This is NOT a D638 strain, and the axis label says so. D638 §3.2.5's nominal
+#   strain is referred to the original GRIP SEPARATION, which was never recorded
+#   for this batch; and a real D638 §11.4 strain needs an extensometer, which is
+#   the DIC pipeline's job. Crosshead travel additionally contains grip slip and
+#   load-frame compliance, both of which inflate it.
+#
+#   The DIC axial gauge length (AXIAL_GAUGE_IN = 4.36 in in TensileDIC_Level1.py)
+#   is used so this axis is at least on the same scale as the DIC record and the
+#   two can be laid side by side. Set TENSILE_GRIP_SEPARATION_MM below if the
+#   grip separation is ever measured, and the panel becomes a true D638 §3.2.5
+#   nominal strain.
+TENSILE_GRIP_SEPARATION_MM: float | None = None      # not recorded
+TENSILE_DIC_GAUGE_MM = 4.36 * IN2MM                  # 110.7 mm
+TENSILE_REF_LENGTH_MM = (TENSILE_GRIP_SEPARATION_MM
+                         if TENSILE_GRIP_SEPARATION_MM is not None
+                         else TENSILE_DIC_GAUGE_MM)
+TENSILE_REF_IS_D638 = TENSILE_GRIP_SEPARATION_MM is not None
+
+# ASTM reference ordinates drawn on the stress-strain panels.
+FLEX_STRAIN_LIMIT_PCT   = 5.0    # D790 §12.2 / §3.2.7 — 5 % flexural strain
+BEARING_DEFORM_PCT      = 4.0    # D953 §13.3 — 4 % hole deformation
+FLEX_DEFL_SPAN_LIMIT    = 0.10   # D790 §12.3 — D/L above which the correction applies
+
+MTS_HEADERS = 8                  # header rows in the MTS .txt before row 1 of data
+
+
+# ---------------------------------------------------------------------------
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 # Toe compensation (ASTM D638 Annex A1)
 #
 # A1.3 says to construct a continuation of the LINEAR (Hookean) region of the
@@ -262,9 +326,16 @@ CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 # load-deflection record, searched over the load band below — restricted so the
 # search cannot land on the noise floor at the very start or on the roll-over
 # near peak, both of which are outside the Hookean region by definition.
+<<<<<<< HEAD
 # The band and window are TOE_SEARCH_LOAD_BAND / TOE_WINDOW_* in SCALAR
 # PARAMETERS above.
 # ---------------------------------------------------------------------------
+=======
+# ---------------------------------------------------------------------------
+TOE_SEARCH_LOAD_BAND = (0.05, 0.60)   # fraction of peak load to search within
+TOE_WINDOW_FRAC      = 0.15           # fit-window width, as a fraction of that band
+TOE_WINDOW_MIN_PTS   = 25             # never fit a window shorter than this
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +358,15 @@ DIR_STYLES      = {0: "-", 45: (0, (6.5, 3.5)), 90: (0, (1.5, 4.0))}
 
 TEST_LETTERS = {"tensile": "T", "flexural": "F", "bearing": "B"}
 TEST_TITLES  = {
+<<<<<<< HEAD
     "tensile":  "Tensile",
     "flexural": "Flexural",
     "bearing":  "Bearing",
+=======
+    "tensile":  "Tensile (ASTM D638-22)",
+    "flexural": "Flexural (ASTM D790-17, Procedure A, 3-point)",
+    "bearing":  "Pin-bearing (ASTM D953-19, Procedure A)",
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
 }
 
 # Fixture malfunction on P01-BCL00-01 (coupon expanded inside the hole, no
@@ -316,11 +393,19 @@ plt.rcParams.update({
 # SPECIMEN SHEET
 # ===========================================================================
 def read_specimen_table() -> tuple[pd.DataFrame, Path]:
+<<<<<<< HEAD
     """Read FSR-SpecimenTesting.csv.
 
     Returns (dataframe, path actually read). Raises SystemExit with every
     failure reported if it cannot be read, since without geometry there is no
     stress-strain panel to draw.
+=======
+    """Read FSR-SpecimenTesting, preferring the CSV export over the .xlsx.
+
+    Returns (dataframe, path actually read). Raises SystemExit with both
+    failures reported if neither source can be read, since without geometry
+    there is no stress-strain panel to draw.
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
     """
     problems = []
 
@@ -339,6 +424,17 @@ def read_specimen_table() -> tuple[pd.DataFrame, Path]:
     else:
         problems.append(f"{SPECIMEN_CSV.name}: not found")
 
+<<<<<<< HEAD
+=======
+    if SPECIMEN_XLSX.exists():
+        try:
+            return pd.read_excel(SPECIMEN_XLSX), SPECIMEN_XLSX
+        except Exception as exc:      # missing openpyxl, file open in Excel, ...
+            problems.append(f"{SPECIMEN_XLSX.name}: {exc}")
+    else:
+        problems.append(f"{SPECIMEN_XLSX.name}: not found")
+
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
     raise SystemExit("Could not read the specimen sheet:\n  "
                      + "\n  ".join(problems))
 
@@ -613,11 +709,18 @@ def tensile_stress_strain(d: np.ndarray, f: np.ndarray, row: pd.Series):
     stress = f / A_0
 
     # --- D638 §3.2.5 nominal strain is (change in grip separation) / (original
+<<<<<<< HEAD
     #     grip separation). The grip separation was measured at 9.00 in, so
     #     this axis is a D638 nominal strain. If TENSILE_GRIP_SEPARATION_IN is
     #     set back to None, the axis divides crosshead travel by the DIC axial
     #     gauge length instead and becomes a machine-frame extension ratio,
     #     NOT a D638 strain — the label says which one it is.
+=======
+    #     grip separation). The grip separation was not recorded, so unless
+    #     TENSILE_GRIP_SEPARATION_MM has been filled in, this axis divides
+    #     crosshead travel by the DIC axial gauge length instead and is a
+    #     machine-frame extension ratio, NOT a D638 strain. Label says so.
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
     L_ref  = TENSILE_REF_LENGTH_MM
     strain = 100.0 * d / L_ref
 
@@ -820,11 +923,19 @@ def plot_test(test: str, coupons: list[dict], figs_dir: Path, print_id: str,
     # ---- right panel: the ASTM reduction -----------------------------------
     ax_ss.set_xlabel(x_lab)
     ax_ss.set_ylabel(y_lab)
+<<<<<<< HEAD
     ss_title = {"tensile":  "Stress – strain",
                 "flexural": "Flexural stress – strain",
                 "bearing":  "Bearing stress – hole deformation"}[test]
     if test == "flexural" and large_deflection:
         ss_title += "\n(large-deflection correction applied)"
+=======
+    ss_title = {"tensile":  "Stress – strain  (D638 §11.2)",
+                "flexural": "Flexural stress – strain  (D790 §12.2 Eq.3, §12.4 Eq.5)",
+                "bearing":  "Bearing stress – hole deformation  (D953 §13.2)"}[test]
+    if test == "flexural" and large_deflection:
+        ss_title += "\n+ §12.3 large-deflection correction"
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
     ax_ss.set_title(ss_title)
 
     # ---- ASTM reference ordinate --------------------------------------------
@@ -924,11 +1035,14 @@ def main() -> None:
     print(f"MTS dir: {mts_dir}")
     print(f"flexural span L = {FLEX_SPAN_MM:.1f} mm ({FLEX_SPAN_MM / IN2MM:.2f} in) "
           f"— confirmed fixture setting")
+<<<<<<< HEAD
     print(f"tensile reference length = {TENSILE_REF_LENGTH_MM:.1f} mm "
           f"({TENSILE_REF_LENGTH_MM / IN2MM:.2f} in) — "
           + ("measured grip separation, D638 §3.2.5 nominal strain"
              if TENSILE_REF_IS_D638 else
              "DIC gauge length; NOT a D638 strain"))
+=======
+>>>>>>> 496cc5d368d2ea4b5ef9ad7138d2f372b0fcb28f
     print(f"toe compensation (D638 Annex A1): {'on' if args.toe else 'off'}   "
           f"tare removal: {'on' if args.baseline else 'off'}   "
           f"D790 §12.3 correction: {'on' if args.large_deflection else 'off'}")
