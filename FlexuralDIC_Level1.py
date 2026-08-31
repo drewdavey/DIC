@@ -170,18 +170,7 @@ MTS_DIR = Path(
 )
 DIC_DIR  = MTS_DIR.parent / "DIC"   # per-coupon CSVs land here, next to MTS/
 RAW_ROOT = DIC_DIR / "raw" / "2026_FSR_Flexural_FCL_FIS"
-# Specimen geometry. THE CSV *IS* THE SHEET — there is no .xlsx any more.
-#
-# 'Width / Dia. (in)' used to be a FORMULA cell in FSR-SpecimenTesting.xlsx.
-# openpyxl does not evaluate formulas, so every time a Level 2 wrote its
-# scalars back into the workbook it saved the formula and dropped the cached
-# value; pandas and openpyxl both read the CACHE, so that column read blank
-# until somebody opened the workbook in Excel and saved it, and
-# specimen_geometry() then returned b_mm = NaN with every stress downstream
-# NaN too. So the workbook is retired. FSR-SpecimenTesting.csv holds evaluated
-# values, needs no Excel engine, and is not locked while something else has it
-# open — mts_plots.py and TensileDIC_Level1.py read it the same way, and the
-# Level 2s write their scalars back into it.
+
 SPECIMEN_STEM  = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting"

@@ -213,10 +213,15 @@ FLEX_SPAN_MM = 8.00 * IN2MM                 # L = 203.2 mm
 #
 #   The DIC axial gauge length (AXIAL_GAUGE_IN = 4.36 in in TensileDIC_Level1.py)
 #   is used so this axis is at least on the same scale as the DIC record and the
-#   two can be laid side by side. Set TENSILE_GRIP_SEPARATION_MM below if the
-#   grip separation is ever measured, and the panel becomes a true D638 §3.2.5
-#   nominal strain.
-TENSILE_GRIP_SEPARATION_MM: float | None = None      # not recorded
+#   two can be laid side by side.
+#
+#   POLICY: the tensile reference length is the 4.36 in DIC axial gauge, always.
+#   Grip separation is NOT to be used for these coupons — it was never measured
+#   for this batch, and a crosshead-over-grip-separation number is a D638 §3.2.5
+#   nominal strain, which is not a valid basis for modulus or for any strain we
+#   report. Every reported tensile strain comes from the DIC pipeline's 4.36 in
+#   virtual extensometer. Leave TENSILE_GRIP_SEPARATION_MM at None.
+TENSILE_GRIP_SEPARATION_MM: float | None = None      # never use grip separation
 TENSILE_DIC_GAUGE_MM = 4.36 * IN2MM                  # 110.7 mm
 TENSILE_REF_LENGTH_MM = (TENSILE_GRIP_SEPARATION_MM
                          if TENSILE_GRIP_SEPARATION_MM is not None
@@ -910,6 +915,11 @@ def main() -> None:
     print(f"MTS dir: {mts_dir}")
     print(f"flexural span L = {FLEX_SPAN_MM:.1f} mm ({FLEX_SPAN_MM / IN2MM:.2f} in) "
           f"— confirmed fixture setting")
+    print(f"tensile reference length = {TENSILE_REF_LENGTH_MM:.1f} mm "
+          f"({TENSILE_REF_LENGTH_MM / IN2MM:.2f} in) — "
+          + ("measured grip separation, D638 §3.2.5 nominal strain"
+             if TENSILE_REF_IS_D638 else
+             "DIC axial gauge length; NOT a D638 strain"))
     print(f"toe compensation (D638 Annex A1): {'on' if args.toe else 'off'}   "
           f"tare removal: {'on' if args.baseline else 'off'}   "
           f"D790 §12.3 correction: {'on' if args.large_deflection else 'off'}")
