@@ -17,7 +17,6 @@ Step B.
 No truncation and no property extraction here — that's Level 2's job, so it
 can be tuned without re-running the slow per-.out pass.
 
-WHY THIS ISN'T TensileDIC_Level1 WITH DIFFERENT CONSTANTS
 ---------------------------------------------------------
 The tensile ROI is the gauge section and each frame reduces to two virtual
 point extensometers. The flexural ROI is the *side profile* — the specimen

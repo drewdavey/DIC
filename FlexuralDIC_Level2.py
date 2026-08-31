@@ -16,8 +16,6 @@ Standards compliance — what each calculation cites
   Flexural strength    : D790 §3.2.7 (max flexural stress, if it breaks < 5 %)
   Curvature modulus    : Euler-Bernoulli, E = (M/I) / kappa. Not in D790 — the
                          DIC-native equivalent of E_B, and the reference here.
-
-THREE STRAIN CHANNELS, AND THEY ARE SUPPOSED TO DISAGREE
 ---------------------------------------------------------
 All three are the strain of the same outer fibre, and they share one force and
 one specimen, so any separation between them is measurement method, not
