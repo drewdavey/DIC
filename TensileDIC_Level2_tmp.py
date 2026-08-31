@@ -115,7 +115,7 @@ LOAD_END_FRAC   = 0.50
 # =============================================================================
 # PROPERTY SETTINGS  (mirrors DIC_Level2.py)
 # =============================================================================
-MODULUS_STRAIN_RANGE = (0.0005, 0.003)
+MODULUS_STRAIN_RANGE = (0.0005, 0.0025)
 YIELD_OFFSET = 0.002
 POISSON_RANGE = (0.0005, 0.0025)
 POISSON_CHORD_AT = 0.002
