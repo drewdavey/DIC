@@ -86,7 +86,7 @@ EXPOSURES  = {"CL": True, "UV": True, "SW": True, "IS": True}
 DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
-APPLY_SMOOTHING = True           # D638 does not require filtering; on for this batch
+APPLY_SMOOTHING = False           # D638 does not require filtering
 FILTER_METHOD   = "butterworth"  # "median" or "butterworth"
 
 # The peak anchor assumes the DIC record actually contains the peak. When the
@@ -100,6 +100,12 @@ FILTER_METHOD   = "butterworth"  # "median" or "butterworth"
 # gain and reports each coupon against it. On P01 this flags TCL45-01 (0.90),
 # TSW00-01 (0.94) and TSW00-02 (0.96) and nothing else.
 DIC_COVERAGE_MIN = 0.98
+
+# The peak anchor is refined by correlating the two force ramps over +/- this
+# fraction of the test duration. It must stay generous: on P01-TSW00-01 and
+# TSW00-02 the true correction is ~6 s, and a narrow search would not reach it.
+LAG_SEARCH_FRAC  = 0.25
+LAG_SEARCH_STEPS = 1001
 
 # =============================================================================
 # ANALYSIS  — must match TensileDIC_Level3 (and FlexuralDIC_Level2's windows)
@@ -224,13 +230,43 @@ def load_mts_txt(fp):
 # =============================================================================
 # PEAK-ANCHORED MTS MAPPING
 # =============================================================================
+def refine_lag(base_time, sync_force, mts_time, mts_force):
+    """Seconds to add to the peak anchor for the best correlation with the MTS
+    force. Returns (lag, r).
+
+    The peak anchor alone trusts a single sample of the sync load channel, and
+    on this batch that channel is unreliable: on P01-TSW00-01 and TSW00-02 its
+    maximum sits ~6 s away from the true peak instant, which anchored the whole
+    record 6 s out and paired an unloaded specimen with 8 kN of force. Matching
+    the two ramps as shapes, over every sample, is what catches that.
+    """
+    span = LAG_SEARCH_FRAC * float(np.nanmax(base_time) - np.nanmin(base_time))
+    if not np.isfinite(span) or span <= 0:
+        return 0.0, np.nan
+    lag_best, r_best = 0.0, -np.inf
+    for lag in np.linspace(-span, span, LAG_SEARCH_STEPS):
+        y = np.interp(base_time + lag, mts_time, mts_force, left=np.nan, right=np.nan)
+        m = np.isfinite(y) & np.isfinite(sync_force)
+        if m.sum() < 50:
+            continue
+        a, b = sync_force[m], y[m]
+        if a.std() == 0 or b.std() == 0:
+            continue
+        r = float(np.mean((a - a.mean()) * (b - b.mean())) / (a.std() * b.std()))
+        if r > r_best:
+            r_best, lag_best = r, float(lag)
+    return lag_best, r_best
+
+
 def map_mts_force_disp(cid, n_l1):
     """Map raw MTS force and displacement onto the DIC frame times.
 
     The sync CSV and the raw MTS file do not share a clock, so their two
-    peak-force rows are treated as the same physical instant and each DIC
-    frame's offset from that anchor is used to interpolate the MTS record.
-    This puts the trustworthy MTS channel behind the WHOLE curve, not just its
+    peak-force rows are treated as the same physical instant, and the residual
+    lag is then refined by correlating the two ramps (see refine_lag — the peak
+    alone is one sample and gets it badly wrong on some coupons). Each DIC
+    frame's offset from that anchor is used to interpolate the MTS record,
+    which puts the trustworthy MTS channel behind the WHOLE curve, not just its
     peak. Displacement is zeroed to its first finite mapped value.
 
     Returns (force_N, disp_mm, info), each array length n_l1 and NaN-padded
@@ -260,7 +296,10 @@ def map_mts_force_disp(cid, n_l1):
     mts_disp_mm = numeric(mts["disp_mm"])
     mts_peak_i = int(np.nanargmax(np.abs(mts_force_N)))
 
-    mapped_time = mts_time[mts_peak_i] + (sync_time - sync_time[sync_peak_i])
+    anchored = mts_time[mts_peak_i] + (sync_time - sync_time[sync_peak_i])
+    lag, lag_r = refine_lag(anchored, sync_force_kip, mts_time, mts_force_N)
+    mapped_time = anchored + lag
+
     force_N = np.interp(mapped_time, mts_time, mts_force_N, left=np.nan, right=np.nan)
     disp_mm = np.interp(mapped_time, mts_time, mts_disp_mm, left=np.nan, right=np.nan)
     finite_disp = np.flatnonzero(np.isfinite(disp_mm))
@@ -268,12 +307,29 @@ def map_mts_force_disp(cid, n_l1):
         disp_mm = disp_mm - disp_mm[finite_disp[0]]
 
     info = {"mts_peak_N": float(abs(mts_force_N[mts_peak_i])),
-            "sync_peak_raw": float(abs(sync_force_kip[sync_peak_i]))}
+            "sync_peak_raw": float(abs(sync_force_kip[sync_peak_i])),
+            "lag_s": lag, "lag_r": lag_r}
 
     print(f"[{cid}] sync_fs={sample_rate_hz(sync_time):.3f} Hz  "
           f"mts_fs={sample_rate_hz(mts_time):.2f} Hz  "
           f"peak_i sync/MTS={sync_peak_i}/{mts_peak_i}  "
-          f"MTS_peak={info['mts_peak_N']:.1f} N")
+          f"MTS_peak={info['mts_peak_N']:.1f} N  "
+          f"lag {lag:+.2f} s (r={lag_r:.4f})")
+    if abs(lag) > 1.0:
+        print(f"    [i] the peak anchor was {abs(lag):.1f} s out on this coupon — "
+              f"the sync load channel's maximum is not at the true peak instant.")
+
+    # The specimen must be unloaded when the DIC reference frame is taken, or
+    # the strain axis starts from an already-strained state while the stress
+    # axis does not. A record that opens above the analysis-window threshold has
+    # not been registered correctly.
+    first = force_N[np.isfinite(force_N)]
+    peak = float(np.nanmax(np.abs(mts_force_N)))
+    if first.size and peak > 0 and abs(first[0]) > LOAD_START_FRAC * peak:
+        print(f"    [!] the first mapped frame already carries {abs(first[0]):.0f} N "
+              f"({100 * abs(first[0]) / peak:.1f} % of peak) — the DIC record does "
+              f"not contain the\n        unloaded specimen, so E and the strain "
+              f"axis for this coupon are not trustworthy.")
 
     if n < n_l1:
         pad = np.full(n_l1 - n, np.nan)
@@ -296,11 +352,12 @@ def add_coverage(rows):
     low = [r for r in rows if np.isfinite(r["dic_coverage"])
            and r["dic_coverage"] < DIC_COVERAGE_MIN]
     for r in sorted(low, key=lambda r: r["dic_coverage"]):
-        print(f"[!] {r['coupon']}: the DIC record only reached "
-              f"{r['dic_coverage'] * 100:.1f} % of this coupon's peak force — "
-              f"it stopped before")
-        print( "    the specimen did, so its UTS and strain-at-UTS are NOT "
-               "the specimen's.")
+        print(f"[!] {r['coupon']}: the sync load channel peaked at "
+              f"{r['dic_coverage'] * 100:.1f} % of the gain the rest of the batch")
+        print( "    shows — either the DIC record stopped before the specimen "
+               "failed, or that channel")
+        print( "    is distorted on this coupon. Check the reported lag and this "
+               "coupon's UTS.")
 
 
 # =============================================================================

@@ -72,7 +72,7 @@ CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 # SWITCHES — which coupons, and which steps
 # =============================================================================
 PRINTS     = ["P01"]
-EXPOSURES  = {"CL": True, "IS": True}      # only CL and IS were bend-tested
+EXPOSURES  = {"CL": True, "IS": False}      # only CL and IS were bend-tested
 DIRECTIONS = {"00": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 

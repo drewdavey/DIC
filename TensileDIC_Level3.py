@@ -4,15 +4,13 @@ TensileDIC_Level3.py  —  FSR Tensile Coupons (ASTM D638)
 =========================================================
 Plots and statistics only. Reads Level-2's per-frame CSVs and the scalar
 properties Level 2 wrote into the specimen sheet; nothing tensile is
-recomputed here. Pin-bearing statistics (ASTM D953) ARE computed here, from
-the raw MTS files — bearing has no DIC/Level-2 step of its own.
-See README.md for the method and for the P01-specific caveats.
+recomputed here. Pin-bearing (ASTM D953) is not part of this pipeline — it has
+no DIC step and lives in Bearing_Level3.py.
 
 INPUT
   <DIC_DIR>/<coupon_id>.csv    per-frame record, Level 1 + Level 2 columns
-  FSR-SpecimenTesting.csv      D638 scalars and coupon thickness, one row per coupon
+  FSR-SpecimenTesting.csv      D638 scalars, one row per coupon
   <MTS_DIR>/P01-T*.txt         raw MTS tensile force/displacement
-  <MTS_DIR>/P01-B*.txt         raw MTS bearing force/displacement
 
 OUTPUT
   <FIGS_ROOT>/<coupon_id>/stress_strain_DIC.png  per-coupon stress-strain
@@ -21,8 +19,8 @@ OUTPUT
   <FIGS_ROOT>/tensile_curves_DIC.png             group stress-strain overlay
   <FIGS_ROOT>/tensile_summary_DIC.png            group property scatter
   <FIGS_ROOT>/tensile_peak_strength_DIC.png      group UTS by exposure
-  stdout                                         D638 + D953 stat tables
-  P01_MechanicalStats.xlsx                       same stats, Tensile + Bearing sheets
+  stdout                                         D638 stat table
+  P01_MechanicalStats.xlsx                       same stats, "Tensile" sheet
 """
 
 from __future__ import annotations
@@ -98,20 +96,7 @@ SPECIMEN_SHEET_COLUMNS = {
 AIRTECH_UTS = {0: 79.3, 45: None, 90: 25.9}    # MPa
 AIRTECH_E   = {0: 6.6,  45: None, 90: 3.7}     # GPa
 
-# =============================================================================
-# BEARING  — ASTM D953-19 Procedure A
-# =============================================================================
 T_DIRECTIONS = [0, 45, 90]
-B_DIRECTIONS = [0, 90]
-
-HOLE_D_MM   = 0.5625 * 25.4       # 14.29 mm reamed hole
-DEF_4PCT_MM = 0.04 * HOLE_D_MM    # 0.572 mm, the 4 % hole-deformation point
-FIT_LO, FIT_HI = 0.10, 0.40       # toe-correction fit window, fraction of F_max
-
-# Fixture malfunction on BCL00-01; P01-BGM00 is the replacement Control 0 deg run.
-SUBST_SRC   = "P01-BGM00"
-SUBST_LABEL = "P01-BCL00-01"
-SKIP_BEAR   = {"P01-BCL00-01", "P01-BCL00-01-TEST"}
 
 # =============================================================================
 # DISPLAY  — same palette as mts_plots.py and FlexuralDIC_Level3
@@ -549,7 +534,7 @@ def build_stats_df(rows_data, exp_order, directions, props, exp_labels):
 
 def write_stats_sheet(path, sheet, df):
     """Write df to one sheet of the workbook, leaving the other sheets alone.
-    FlexuralDIC_Level3 writes a Flexural sheet into this same file."""
+    FlexuralDIC_Level3 and Bearing_Level3 write their sheets into this same file."""
     if path.exists():
         writer = pd.ExcelWriter(path, engine="openpyxl", mode="a",
                                 if_sheet_exists="replace")
@@ -560,11 +545,10 @@ def write_stats_sheet(path, sheet, df):
 
 
 # =============================================================================
-# STATS — tensile rows (D638) and bearing rows (D953)
+# STATS — tensile rows (D638)
 # =============================================================================
 def load_spec_sheet_raw():
-    """Specimen sheet with its original headers, indexed by Specimen ID —
-    needed for coupon thickness (bearing area) as well as the tensile scalars."""
+    """Specimen sheet with its original headers, indexed by Specimen ID."""
     df = read_specimen_csv()
     if "Print ID" in df.columns:
         df = df[df["Print ID"] == PRINTS[0]]
@@ -619,93 +603,11 @@ def load_tensile_fmax():
         fmax[cid] = float(np.max(raw["force_N"].to_numpy()))
     return fmax
 
-def get_t_mm(spec_df, t_col, sid):
-    if t_col is None or sid not in spec_df.index:
-        return None
-    v = spec_df.loc[sid, t_col]
-    if isinstance(v, pd.Series):
-        v = v.iloc[0]
-    return float(v) * 25.4 if pd.notna(v) else None
-
-def parse_bearing_stem(stem):
-    """Return (exp_code, d_int, spec_id) or (None, None, None)."""
-    canon = re.sub(r"-TEST$", "", stem, flags=re.IGNORECASE)
-    if canon.upper() == SUBST_SRC:
-        return "CL", 0, SUBST_LABEL
-    parts = stem.split("-")
-    if len(parts) < 2 or not parts[1].upper().startswith("B") or len(parts[1]) < 5:
-        return None, None, None
-    key = parts[1].upper()
-    exp_code = key[1:-2]
-    try:
-        d_int = int(key[-2:])
-    except ValueError:
-        return None, None, None
-    if exp_code not in EXPOSURE_LABELS or d_int not in B_DIRECTIONS:
-        return None, None, None
-    rep = ""
-    if len(parts) >= 3:
-        p3 = re.sub(r"^TEST", "", parts[2], flags=re.IGNORECASE)
-        if p3.isdigit():
-            rep = p3
-    base = f"{PRINTS[0]}-B{exp_code}{d_int:02d}"
-    return exp_code, d_int, (f"{base}-{int(rep):02d}" if rep else base)
-
-def load_bearing_rows(spec_df, t_col):
-    rows = []
-    for fp in sorted(MTS_DIR.glob(f"{PRINTS[0]}-B*.txt")):
-        stem = fp.stem
-        if stem.upper() in {s.upper() for s in SKIP_BEAR}:
-            continue
-        exp_code, d_int, spec_id = parse_bearing_stem(stem)
-        if exp_code is None:
-            continue
-        t_mm = get_t_mm(spec_df, t_col, spec_id)
-        if t_mm is None:
-            continue
-
-        raw = read_mts_txt(fp).dropna(subset=["disp_mm", "force_N"])
-        if len(raw) < 10:
-            continue
-        d = raw["disp_mm"].to_numpy() - raw["disp_mm"].iloc[0]
-        f = raw["force_N"].to_numpy()
-        F_max = float(np.max(f))
-
-        # Toe correction (D953 Appendix X1): fit the 10-40 % F_max region and
-        # project back to F = 0. That x-intercept is the machine take-up.
-        fit_m = (f >= FIT_LO * F_max) & (f <= FIT_HI * F_max)
-        if fit_m.sum() < 3:
-            continue
-        slope, intercept = np.polyfit(d[fit_m], f[fit_m], 1)
-        d_corr = d - (-intercept / slope)
-
-        # P at 4 % hole deformation (D953-19 3.2.2): pre-peak only, made
-        # monotone so np.interp is valid.
-        i_max = int(np.argmax(f))
-        dc, fc = d_corr[:i_max + 1], f[:i_max + 1]
-        keep = np.concatenate(([True], np.diff(np.maximum.accumulate(dc)) > 0))
-        dc_m, fc_m = dc[keep], fc[keep]
-        failed = float(np.max(dc_m)) < DEF_4PCT_MM
-        P_4pct = F_max if failed else float(np.interp(DEF_4PCT_MM, dc_m, fc_m))
-
-        area = t_mm * HOLE_D_MM       # D953-19 13.3
-        rows.append({"exp": exp_code, "dir": d_int, "cid": spec_id,
-                     "F_max_N": F_max,
-                     "S_b":    P_4pct / area,    # D953-19 13.3 Eq. 1
-                     "S_max":  F_max / area,     # D953-19 3.2.5
-                     "failed": failed})
-    return rows
-
-
 def run_print_stats():
-    spec_df = load_spec_sheet_raw()
-    t_col = next((c for c in spec_df.columns if "thickness" in c.lower()), None)
-
-    tensile_rows = load_tensile_stats_rows(spec_df)
+    tensile_rows = load_tensile_stats_rows(load_spec_sheet_raw())
     fmax = load_tensile_fmax()
     for r in tensile_rows:
         r["F_max_N"] = fmax.get(r["cid"])
-    bearing_rows = load_bearing_rows(spec_df, t_col)
 
     #             (key,            header,        dec_m, dec_s, w_m, w_s)
     tensile_props = [
@@ -720,27 +622,10 @@ def run_print_stats():
                 tensile_rows, EXPOSURE_ORDER, T_DIRECTIONS,
                 tensile_props, EXPOSURE_LABELS)
 
-    bearing_props = [
-        ("F_max_N", "F_max (N)",   1, 1, 6, 5),
-        ("S_b",     "S_b (MPa)",   1, 1, 5, 4),
-        ("S_max",   "S_max (MPa)", 1, 1, 5, 4),
-    ]
-    print_table("\nPIN-BEARING PROPERTIES — ASTM D953-19 Procedure A",
-                bearing_rows, EXPOSURE_ORDER, B_DIRECTIONS,
-                bearing_props, EXPOSURE_LABELS)
-
-    n_failed = sum(r["failed"] for r in bearing_rows)
-    if n_failed:
-        print(f"\n  Note: {n_failed} coupon(s) failed before reaching 4% hole deformation.")
-        print("        For those, P_4pct = F_max (conservative upper bound for S_b).")
-
     write_stats_sheet(OUT_STATS_XLSX, "Tensile",
                       build_stats_df(tensile_rows, EXPOSURE_ORDER, T_DIRECTIONS,
                                      tensile_props, EXPOSURE_LABELS))
-    write_stats_sheet(OUT_STATS_XLSX, "Bearing",
-                      build_stats_df(bearing_rows, EXPOSURE_ORDER, B_DIRECTIONS,
-                                     bearing_props, EXPOSURE_LABELS))
-    print(f"\nExported: {OUT_STATS_XLSX} [Tensile, Bearing]")
+    print(f"\nExported: {OUT_STATS_XLSX} [Tensile]")
 
 
 # =============================================================================

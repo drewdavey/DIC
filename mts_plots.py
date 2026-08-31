@@ -28,8 +28,8 @@ Outputs (per print folder):
 
 This is a first-look script — no filtering, no property extraction. For the
 D638 tensile properties use TensileDIC_Level1-3, for the D790 flexural
-properties use FlexuralDIC_Level1-2, and for the D953 bearing strengths use
-bearing_group_plots.py.
+properties use FlexuralDIC_Level1-3, and for the D953 bearing strengths use
+Bearing_Level3.py.
 
 Usage:
   python mts_plots.py                      # P01, all three tests

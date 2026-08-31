@@ -57,7 +57,7 @@ CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 # SWITCHES
 # =============================================================================
 PRINTS     = ["P01"]
-EXPOSURES  = {"CL": True, "IS": True}
+EXPOSURES  = {"CL": True, "IS": False}
 DIRECTIONS = {"00": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
