@@ -1,39 +1,28 @@
 #!/usr/bin/env python3
 """
-DIC_Level3.py  —  FSR Tensile Coupons
-======================================
-Plot- and stats-only. Reads Level-2's per-frame curve CSVs and the scalar
-mechanical properties Level-2 already wrote into FSR-SpecimenTesting.csv
-(the single source of truth for tensile scalars — nothing tensile is
-recomputed here), and produces per-coupon plots, group overlay/summary
-plots, and mean ± std (CV%) property tables. Pin-bearing statistics are
-computed here directly from the raw MTS files (bearing has no DIC/Level-2
-step of its own).
+TensileDIC_Level3.py  —  FSR Tensile Coupons (ASTM D638)
+=========================================================
+Plots and statistics only. Reads Level-2's per-frame CSVs and the scalar
+properties Level 2 wrote into the specimen sheet; nothing tensile is
+recomputed here. Pin-bearing statistics (ASTM D953) ARE computed here, from
+the raw MTS files — bearing has no DIC/Level-2 step of its own.
+See README.md for the method and for the P01-specific caveats.
 
-INPUT per coupon
-  <DIC_DIR>/<coupon_id>.csv      Level-1's per-frame record with Level-2's columns
-                                 appended (kept, force_N, stress_MPa, strain_axial,
-                                 strain_transverse, stress_MPa_unsmoothed,
-                                 strain_axial_unsmoothed) — written by DIC_Level1.py
-                                 and DIC_Level2.py. Only kept==True rows are used;
-                                 i_uts (index of UTS) is derived here via argmax,
-                                 not stored.
-  FSR-SpecimenTesting.csv        scalar properties (E, toe strain, yield
-                                 stress/strain, UTS, strain at UTS, Poisson's
-                                 ratio), one row per coupon, matched by
-                                 "Specimen ID" — written by DIC_Level2.py
-  <MTS_DIR>/P01-T*.txt           raw MTS tensile force/displacement (group MTS plot + F_max stats)
-  <MTS_DIR>/P01-B*.txt           raw MTS bearing force/displacement (bearing stats only)
+INPUT
+  <DIC_DIR>/<coupon_id>.csv    per-frame record, Level 1 + Level 2 columns
+  FSR-SpecimenTesting.csv      D638 scalars and coupon thickness, one row per coupon
+  <MTS_DIR>/P01-T*.txt         raw MTS tensile force/displacement
+  <MTS_DIR>/P01-B*.txt         raw MTS bearing force/displacement
 
 OUTPUT
-  {FIGS_ROOT}/{coupon_id}/stress_strain_DIC.png   per-coupon σ–ε (toe-corrected, to UTS)
-  {FIGS_ROOT}/{coupon_id}/poisson_DIC.png         per-coupon −ε_xx vs ε_yy (to UTS)
-  {FIGS_ROOT}/tensile_mts_FD.png                  group force vs. displacement (raw MTS)
-  {FIGS_ROOT}/tensile_curves_DIC.png              group σ–ε overlay
-  {FIGS_ROOT}/tensile_summary_DIC.png             group property scatter (UTS, E)
-  {FIGS_ROOT}/tensile_peak_strength_DIC.png       group UTS by exposure
-  stdout                                          tensile (D638) + bearing (D953) stat tables
-  P01_MechanicalStats.xlsx                        same stats, Tensile + Bearing sheets
+  <FIGS_ROOT>/<coupon_id>/stress_strain_DIC.png  per-coupon stress-strain
+  <FIGS_ROOT>/<coupon_id>/poisson_DIC.png        per-coupon −ε_xx vs ε_yy
+  <FIGS_ROOT>/tensile_mts_FD.png                 group force vs displacement
+  <FIGS_ROOT>/tensile_curves_DIC.png             group stress-strain overlay
+  <FIGS_ROOT>/tensile_summary_DIC.png            group property scatter
+  <FIGS_ROOT>/tensile_peak_strength_DIC.png      group UTS by exposure
+  stdout                                         D638 + D953 stat tables
+  P01_MechanicalStats.xlsx                       same stats, Tensile + Bearing sheets
 """
 
 from __future__ import annotations
@@ -59,26 +48,13 @@ FIGS_ROOT = Path(
     r"\01_MaterialTesting\02_Mechanical Testing\04_TestCoupons"
     r"\P01-LT150-LH4.5\figs"
 )
-DIC_DIR = FIGS_ROOT.parent / "DIC"   # per-frame CSVs written by Level 1, appended to by Level 2
-MTS_DIR = FIGS_ROOT.parent / "MTS"   # raw MTS .txt files (group MTS plot only)
-# Specimen sheet. THE CSV *IS* THE SHEET — there is no .xlsx any more.
-#
-# "Width / Dia. (in)" and "Computed Area (in²)" used to be FORMULA cells in
-# FSR-SpecimenTesting.xlsx, and openpyxl does not evaluate formulas: every time
-# a Level 2 saved its scalars back into the workbook it wrote the formula and
-# dropped the cached value, so Level 1 read those columns back as blank, wrote
-# area_mm2 = NaN, and Level 2 then reported "insufficient data" for every
-# coupon. The workbook is retired. FSR-SpecimenTesting.csv holds evaluated
-# values, needs no Excel engine, is not locked while something else has it
-# open, and is what every script in this folder now both reads and writes.
+DIC_DIR = FIGS_ROOT.parent / "DIC"
+MTS_DIR = FIGS_ROOT.parent / "MTS"
 SPECIMEN_CSV = Path(
     r"Z:\2023_07_SIO_Functional_Surfing_Reef\04_Drew"
     r"\01_MaterialTesting\02_Mechanical Testing\FSR-SpecimenTesting.csv"
 )
-
-# The CSV started life as a Windows Excel export, so its superscript characters
-# ("Computed Area (in²)") may still be cp1252 rather than UTF-8. Try in this
-# order; write_specimen_sheet re-writes the file as utf-8-sig.
+OUT_STATS_XLSX = FIGS_ROOT.parent / "P01_MechanicalStats.xlsx"
 CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # =============================================================================
@@ -90,41 +66,23 @@ DIRECTIONS = {"00": True, "45": True, "90": True}
 REPLICATES = ["01", "02", "03"]
 
 DO_PER_COUPON_PLOTS = True
-DO_GROUP_PLOTS      = True   # MTS force-disp + DIC curve/summary/peak-strength group figures
-DO_PRINT_STATS      = True   # mean ± std (CV%) tables (tensile + bearing) + P01_MechanicalStats.xlsx
+DO_GROUP_PLOTS      = True
+DO_PRINT_STATS      = True
 
-# P01-TCL45-01 was excluded here for an "anomalously large toe correction".
-# 2026-08-29: that was a symptom, not the cause. Its DIC sync record covers only
-# 90.6 % of the MTS peak force — the recording stopped before the specimen
-# failed — so max(|load_raw|) is not the peak and the peak-anchored stress axis
-# was inflated ~10 %, which is where the large toe came from.
-#
-# TensileDIC_Level2's regressed load scale fixes this coupon's MODULUS
-# (E drops 10.8 % and comes back into family with TCL45-02/03). Its UTS and
-# strain-at-UTS are NOT recoverable — the specimen's peak was never recorded —
-# so it must stay out of any group statistic involving those. P01-TSW00-01
-# (96.3 % coverage) and P01-TSW00-02 (97.2 %) have the same defect more mildly
-# and are deliberately NOT excluded here; see the README before quoting their
-# UTS either.
-#
-# TODO: this switch is all-or-nothing per coupon. Splitting it into
-#       DIC_EXCLUDE_MODULUS / DIC_EXCLUDE_STRENGTH would let TCL45-01's now-good
-#       modulus back into the group stats while keeping its UTS out. Left as-is
-#       pending a decision on how the three truncated coupons get reported.
+# P01-TCL45-01's DIC record stops at 90.6 % of the MTS peak force, so its UTS
+# and strain-at-UTS are not the specimen's. See README.md.
 DIC_EXCLUDE = {"P01-TCL45-01"}
 
 # =============================================================================
-# PLOT-ANNOTATION RANGES — keep in sync with DIC_Level2.py
-# (used only to draw the modulus/offset/Poisson reference lines; the actual
-# scalar values come from the Excel sheet, not recomputed here)
+# ANALYSIS  — must match TensileDIC_Level2
 # =============================================================================
-MODULUS_STRAIN_RANGE = (0.0005, 0.003)
-YIELD_OFFSET = 0.002
-POISSON_RANGE = (0.0005, 0.0025)
-POISSON_CHORD_AT = 0.002
+MODULUS_STRAIN_RANGE = (0.0005, 0.003)   # used only to draw the tangent line
+YIELD_OFFSET         = 0.002             # D638 A2.6
+POISSON_RANGE        = (0.0005, 0.0025)  # D638 A3.10.1.3
+POISSON_CHORD_AT     = 0.002
+MTS_HEADERS = 8
 
-# Excel column headers for each scalar property — keep in sync with
-# DIC_Level2.py's SPECIMEN_SHEET_COLUMNS (this is the inverse mapping).
+# Sheet headers written by TensileDIC_Level2, inverted back to property keys.
 SPECIMEN_SHEET_COLUMNS = {
     "E_GPa":         "E (GPa)",
     "eps_toe":       "Toe Strain",
@@ -136,38 +94,34 @@ SPECIMEN_SHEET_COLUMNS = {
     "poisson_slope": "Poisson's Ratio (slope)",
 }
 
-# Airtech reference values (printed material spec — comparison lines)
+# Airtech printed-material spec, drawn as comparison lines.
 AIRTECH_UTS = {0: 79.3, 45: None, 90: 25.9}    # MPa
 AIRTECH_E   = {0: 6.6,  45: None, 90: 3.7}     # GPa
 
 # =============================================================================
-# DISPLAY
+# BEARING  — ASTM D953-19 Procedure A
 # =============================================================================
-EXPOSURE_ORDER    = ["CL", "UV", "SW", "IS"]
-EXPOSURE_COLORS   = {"CL": "#1f77b4", "SW": "#17becf", "UV": "#ff7f0e", "IS": "#2ca02c"}
-EXPOSURE_LABELS   = {"CL": "Control", "UV": "UV", "SW": "Seawater", "IS": "SW+UV"}
-DIRECTION_MARKERS = {"00": "o", "45": "s", "90": "^"}
-DIR_STYLES        = {0: "-", 45: "--", 90: ":"}   # MTS group plot line styles, int-keyed
+T_DIRECTIONS = [0, 45, 90]
+B_DIRECTIONS = [0, 90]
 
-MTS_HEADERS = 8
+HOLE_D_MM   = 0.5625 * 25.4       # 14.29 mm reamed hole
+DEF_4PCT_MM = 0.04 * HOLE_D_MM    # 0.572 mm, the 4 % hole-deformation point
+FIT_LO, FIT_HI = 0.10, 0.40       # toe-correction fit window, fraction of F_max
 
-# =============================================================================
-# PRINT-STATS SETTINGS  (ASTM D638-14 tensile + ASTM D953-19 Procedure A bearing)
-# =============================================================================
-T_DIRECTIONS = [0, 45, 90]   # tensile
-B_DIRECTIONS = [0, 90]       # bearing (no 45° coupons)
-
-# D953 geometry
-HOLE_D_MM   = 0.5625 * 25.4    # 14.29 mm reamed hole diameter
-DEF_4PCT_MM = 0.04 * HOLE_D_MM # 0.572 mm — 4% hole deformation threshold
-FIT_LO, FIT_HI = 0.10, 0.40    # toe-correction linear fit window (fraction of F_max)
-
-# BGM00 substitute (fixture malfunction on BCL00-01)
+# Fixture malfunction on BCL00-01; P01-BGM00 is the replacement Control 0 deg run.
 SUBST_SRC   = "P01-BGM00"
 SUBST_LABEL = "P01-BCL00-01"
 SKIP_BEAR   = {"P01-BCL00-01", "P01-BCL00-01-TEST"}
 
-OUT_STATS_XLSX = FIGS_ROOT.parent / "P01_MechanicalStats.xlsx"
+# =============================================================================
+# DISPLAY  — same palette as mts_plots.py and FlexuralDIC_Level3
+# =============================================================================
+EXPOSURE_ORDER    = ["CL", "UV", "SW", "IS"]
+EXPOSURE_LABELS   = {"CL": "Control", "UV": "UV", "SW": "Seawater", "IS": "SW+UV"}
+EXPOSURE_COLORS   = {"CL": "#2a78d6", "UV": "#eb6834", "SW": "#1baf7a", "IS": "#4a3aa7"}
+DIRECTION_MARKERS = {"00": "o", "45": "s", "90": "^"}
+DIR_STYLES        = {0: "-", 45: (0, (6.5, 3.5)), 90: (0, (1.5, 4.0))}
+
 
 # =============================================================================
 # HELPERS
@@ -182,85 +136,76 @@ def selected_coupons():
             for r in REPLICATES]
 
 def parse_id(cid):
-    """Return (exposure, direction_str) e.g. ('CL', '00')."""
+    """Return (exposure, direction_str), e.g. ('CL', '00')."""
     part = cid.split("-")[1]
     return part[1:-2], part[-2:]
 
-def find_frames_csv(cid):
-    p = DIC_DIR / f"{cid}.csv"
-    return p if p.exists() else None
-
-def read_specimen_csv() -> pd.DataFrame:
-    """The specimen sheet, whatever encoding it is still carrying.
-
-    The file started life as a Windows Excel export and the Level 2s re-write
-    it as utf-8-sig, so both spellings of "Computed Area (in²)" have to be
-    readable.
-    """
+def read_specimen_csv():
     for enc in CSV_ENCODINGS:
         try:
             return pd.read_csv(SPECIMEN_CSV, encoding=enc)
         except UnicodeDecodeError:
             continue
-    raise SystemExit(f"{SPECIMEN_CSV.name}: not decodable as "
-                     f"{'/'.join(CSV_ENCODINGS)}")
+    raise SystemExit(f"{SPECIMEN_CSV.name}: not decodable as {'/'.join(CSV_ENCODINGS)}")
 
-def load_specimen_scalars() -> pd.DataFrame:
-    """Read scalar properties back out of SPECIMEN_CSV, indexed by coupon,
-    with columns renamed from sheet headers back to property keys."""
+def load_specimen_scalars():
+    """Specimen sheet indexed by coupon, columns renamed back to property keys."""
     df = read_specimen_csv().set_index("Specimen ID")
     inverse = {label: key for key, label in SPECIMEN_SHEET_COLUMNS.items()}
     cols = {c: inverse[c] for c in df.columns if c in inverse}
     return df.rename(columns=cols)[list(cols.values())]
 
-def load_kept_curve(cid) -> pd.DataFrame | None:
-    """Read a coupon's per-frame CSV and return only the rows Level-2 kept
-    inside its truncated analysis window (kept == True)."""
-    fp = find_frames_csv(cid)
-    if fp is None:
+def load_kept_curve(cid):
+    """Rows inside Level-2's analysis window, or None."""
+    fp = DIC_DIR / f"{cid}.csv"
+    if not fp.exists():
         return None
     df = pd.read_csv(fp)
     if "kept" not in df.columns:
         return None
     return df.loc[df["kept"].astype(bool)].reset_index(drop=True)
 
-def load_props(cid, scalars: pd.DataFrame):
-    """Combine the per-frame curve CSV with this coupon's scalar row into
-    the same props dict shape DIC_Level2.py's compute_properties() used to
-    hand to the plotter."""
+def load_props(cid, scalars):
+    """Per-frame curve plus this coupon's scalar row, or None."""
     curve = load_kept_curve(cid)
     if curve is None or curve.empty or cid not in scalars.index:
         return None
     row = scalars.loc[cid]
-    props = {k: float(row[k]) if pd.notna(row[k]) else np.nan
-              for k in SPECIMEN_SHEET_COLUMNS}
-    props["_eps"]     = curve["strain_axial"].to_numpy()
-    props["_sig"]     = curve["stress_MPa"].to_numpy()
-    props["_eps_t"]   = curve["strain_transverse"].to_numpy()
-    props["_i_uts"]   = int(np.nanargmax(props["_sig"]))
+    props = {k: (float(row[k]) if pd.notna(row[k]) else np.nan)
+             for k in SPECIMEN_SHEET_COLUMNS}
+    props["_eps"]   = curve["strain_axial"].to_numpy()
+    props["_sig"]   = curve["stress_MPa"].to_numpy()
+    props["_eps_t"] = curve["strain_transverse"].to_numpy()
+    props["_i_uts"] = int(np.nanargmax(props["_sig"]))
     props["_eps_raw"] = (curve["strain_axial_unsmoothed"].to_numpy()
-                          if "strain_axial_unsmoothed" in curve.columns else None)
+                         if "strain_axial_unsmoothed" in curve.columns else None)
     props["_sig_raw"] = (curve["stress_MPa_unsmoothed"].to_numpy()
-                          if "stress_MPa_unsmoothed" in curve.columns else None)
+                         if "stress_MPa_unsmoothed" in curve.columns else None)
     return props
+
+def read_mts_txt(fp):
+    """MTS .txt: 8-line header, tab separated, cols disp_mm force_N output_V time_s."""
+    raw = pd.read_csv(fp, sep="\t", skiprows=MTS_HEADERS, header=None,
+                      names=["disp_mm", "force_N", "output_V", "time_s"],
+                      encoding="utf-8-sig", on_bad_lines="skip")
+    return raw.apply(pd.to_numeric, errors="coerce")
+
 
 # =============================================================================
 # PER-COUPON PLOTS
 # =============================================================================
 def plot_stress_strain(cid, props, fig_dir):
-    """σ-ε curve, toe-corrected, truncated at UTS. The raw (pre-smoothing,
-    but still truncated) signal is drawn behind it in light gray, with its
-    own peak marked, for comparison."""
+    """Stress-strain, toe-corrected and truncated at UTS. The pre-smoothing
+    signal is drawn behind it in grey when Level 2 kept one."""
     exp, d_str = parse_id(cid)
-    direction  = int(d_str)
-
-    sl  = slice(0, props["_i_uts"] + 1)
-    e_p = props["_eps"][sl] * 100   # % strain
-    s_p = props["_sig"][sl]
+    direction = int(d_str)
+    sl = slice(0, props["_i_uts"] + 1)
+    eps = props["_eps"][sl] * 100
+    sig = props["_sig"][sl]
 
     fig, ax = plt.subplots(figsize=(7, 4.8))
 
-    eps_r, sig_r = props.get("_eps_raw"), props.get("_sig_raw")
+    eps_r, sig_r = props["_eps_raw"], props["_sig_raw"]
     if eps_r is not None and sig_r is not None and np.any(np.isfinite(sig_r)):
         ax.plot(eps_r * 100, sig_r, lw=0.8, color="0.8", zorder=1,
                 label="raw (unsmoothed)")
@@ -268,39 +213,34 @@ def plot_stress_strain(cid, props, fig_dir):
         ax.plot(eps_r[i_raw] * 100, sig_r[i_raw], "^", color="0.6", ms=8,
                 zorder=2, label=f"raw UTS = {sig_r[i_raw]:.1f} MPa")
 
-    ax.plot(e_p, s_p, lw=1.4, color=EXPOSURE_COLORS.get(exp, "#333"),
+    ax.plot(eps, sig, lw=1.4, color=EXPOSURE_COLORS.get(exp, "#333"),
             label=cid, zorder=3)
 
     E_MPa = props["E_GPa"] * 1000.0
     if np.isfinite(E_MPa):
-        # Elastic line through toe-corrected origin (D638 Annex A1)
         x_e = np.array([0.0, MODULUS_STRAIN_RANGE[1] * 1.5])
         ax.plot(x_e * 100, E_MPa * x_e, "k--", lw=0.8, alpha=0.7,
                 label=f"E = {props['E_GPa']:.1f} GPa")
-        # 0.2% offset line — start at YIELD_OFFSET on the toe-corrected axis
-        x_o_end = max(YIELD_OFFSET + 0.005,
-                      props["eps_y"] if np.isfinite(props["eps_y"]) else YIELD_OFFSET + 0.005)
-        x_o = np.linspace(YIELD_OFFSET, x_o_end, 50)
+        end = props["eps_y"] if np.isfinite(props["eps_y"]) else YIELD_OFFSET + 0.005
+        x_o = np.linspace(YIELD_OFFSET, max(YIELD_OFFSET + 0.005, end), 50)
         ax.plot(x_o * 100, E_MPa * (x_o - YIELD_OFFSET), "k:", lw=0.8, alpha=0.6,
                 label="0.2% offset")
     if np.isfinite(props["sigma_y_MPa"]):
-        ax.plot(props["eps_y"] * 100, props["sigma_y_MPa"], "o",
-                color="orange", ms=7, zorder=5,
-                label=f"σ_y = {props['sigma_y_MPa']:.1f} MPa")
-    ax.plot(props["eps_at_UTS"] * 100, props["UTS_MPa"], "^",
-            color="red", ms=8, zorder=5,
-            label=f"UTS = {props['UTS_MPa']:.1f} MPa")
+        ax.plot(props["eps_y"] * 100, props["sigma_y_MPa"], "o", color="orange",
+                ms=7, zorder=5, label=f"σ_y = {props['sigma_y_MPa']:.1f} MPa")
+    ax.plot(props["eps_at_UTS"] * 100, props["UTS_MPa"], "^", color="red",
+            ms=8, zorder=5, label=f"UTS = {props['UTS_MPa']:.1f} MPa")
 
-    ref_uts = AIRTECH_UTS.get(direction)
-    if ref_uts is not None:
-        ax.axhline(ref_uts, color="grey", linestyle=":", lw=1.0, alpha=0.7,
-                   label=f"Airtech UTS = {ref_uts} MPa")
+    ref = AIRTECH_UTS.get(direction)
+    if ref is not None:
+        ax.axhline(ref, color="grey", linestyle=":", lw=1.0, alpha=0.7,
+                   label=f"Airtech UTS = {ref} MPa")
 
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     ax.set_xlabel("Axial Strain (%)")
     ax.set_ylabel("Engineering Stress (MPa)")
-    ax.set_title(f"{cid}  —  {EXPOSURE_LABELS.get(exp, exp)}, {direction}°")
+    ax.set_title(f"{cid}  —  {EXPOSURE_LABELS.get(exp, exp)}, {direction} deg")
     ax.grid(alpha=0.25, linestyle="--")
     ax.legend(fontsize=8, framealpha=0.85, loc="best")
     fig.tight_layout()
@@ -309,26 +249,22 @@ def plot_stress_strain(cid, props, fig_dir):
     plt.close(fig)
     return out
 
+
 def plot_poisson(cid, props, fig_dir):
     """−ε_xx vs ε_yy, truncated at UTS."""
-    eps   = props["_eps"]
     eps_t = props["_eps_t"]
     if not np.any(np.isfinite(eps_t)):
         return None
-    i_uts = props["_i_uts"]
-    sl = slice(0, i_uts + 1)
-    e_p, et_p = eps[sl], eps_t[sl]
+    sl = slice(0, props["_i_uts"] + 1)
 
     fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.plot(e_p * 100, -et_p * 100, lw=1.2, label="data")
-    nu_c = props["poisson_chord"]
+    ax.plot(props["_eps"][sl] * 100, -eps_t[sl] * 100, lw=1.2, label="data")
     nu_s = props["poisson_slope"]
     if np.isfinite(nu_s):
-        # show fit line over Poisson range
         x = np.linspace(POISSON_RANGE[0], POISSON_RANGE[1], 20)
         ax.plot(x * 100, nu_s * x * 100, "k--", lw=0.8, alpha=0.7,
                 label=f"slope ν = {nu_s:.3f}")
-    if np.isfinite(nu_c):
+    if np.isfinite(props["poisson_chord"]):
         ax.axvline(POISSON_CHORD_AT * 100, color="orange", ls=":", lw=0.8, alpha=0.6)
     else:
         ax.set_title(cid)
@@ -361,34 +297,27 @@ def group_load_mts_coupons():
             d_int = int(key[-2:])
         except ValueError:
             continue
-        if exp_code not in EXPOSURE_COLORS or d_int not in {0, 45, 90}:
+        if exp_code not in EXPOSURE_COLORS or d_int not in T_DIRECTIONS:
             continue
 
-        raw = pd.read_csv(fp, sep="\t", skiprows=MTS_HEADERS, header=None,
-                          names=["disp_mm", "force_N", "output_V", "time_s"],
-                          encoding="utf-8-sig", on_bad_lines="skip")
-        raw = raw.apply(pd.to_numeric, errors="coerce").dropna(subset=["disp_mm", "force_N"])
+        raw = read_mts_txt(fp).dropna(subset=["disp_mm", "force_N"])
         if len(raw) < 10:
             continue
-
         d = raw["disp_mm"].to_numpy() - raw["disp_mm"].iloc[0]
         f = raw["force_N"].to_numpy() / 1000
         i_peak = int(np.argmax(f))
-
-        coupons.append({"exp": exp_code, "dir": d_int,
-                        "d": d, "f": f, "i_peak": i_peak})
+        coupons.append({"exp": exp_code, "dir": d_int, "d": d, "f": f, "i_peak": i_peak})
         print(f"[{stem}]  peak {f[i_peak]:.2f} kN")
 
     print(f"\n{len(coupons)} MTS coupons loaded")
     return coupons
 
+
 def group_plot_mts_force_displacement(coupons):
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for c in coupons:
-        ax.plot(c["d"], c["f"],
-                color=EXPOSURE_COLORS[c["exp"]],
-                ls=DIR_STYLES[c["dir"]],
-                lw=0.9, alpha=0.75)
+        ax.plot(c["d"], c["f"], color=EXPOSURE_COLORS[c["exp"]],
+                ls=DIR_STYLES[c["dir"]], lw=0.9, alpha=0.75)
         ax.scatter(c["d"][c["i_peak"]], c["f"][c["i_peak"]],
                    color=EXPOSURE_COLORS[c["exp"]], s=30, zorder=5)
 
@@ -401,14 +330,13 @@ def group_plot_mts_force_displacement(coupons):
     exp_active = [e for e in EXPOSURE_ORDER if any(c["exp"] == e for c in coupons)]
     handles = [mpatches.Patch(color=EXPOSURE_COLORS[e], label=EXPOSURE_LABELS[e])
                for e in exp_active]
-    for d_int, ls in DIR_STYLES.items():
-        handles.append(mlines.Line2D([], [], color="k", ls=ls, lw=1.2,
-                                     label=f"{d_int}°"))
+    for d_int in sorted({c["dir"] for c in coupons}):
+        handles.append(mlines.Line2D([], [], color="k", ls=DIR_STYLES[d_int],
+                                     lw=1.2, label=f"{d_int}°"))
     handles.append(plt.scatter([], [], color="k", s=30, label="Peak force"))
-
     ax.legend(handles=handles, fontsize=9, loc="upper left", framealpha=0.85)
-    fig.tight_layout()
 
+    fig.tight_layout()
     out = FIGS_ROOT / "tensile_mts_FD.png"
     fig.savefig(out, dpi=600, bbox_inches="tight")
     plt.close(fig)
@@ -416,9 +344,9 @@ def group_plot_mts_force_displacement(coupons):
 
 
 # =============================================================================
-# GROUP PLOTS — DIC-derived σ-ε and scalar properties
+# GROUP PLOTS — DIC-derived
 # =============================================================================
-def group_load_dic_coupons(scalars: pd.DataFrame):
+def group_load_dic_coupons(scalars):
     coupons = []
     for cid in selected_coupons():
         if cid in DIC_EXCLUDE:
@@ -427,43 +355,30 @@ def group_load_dic_coupons(scalars: pd.DataFrame):
         if df is None or df.empty or cid not in scalars.index:
             continue
         exp, d_str = parse_id(cid)
-        i_uts = int(np.nanargmax(df["stress_MPa"].to_numpy()))
-        sl = slice(0, i_uts + 1)
-        ef = df["strain_axial"].to_numpy()[sl]
-        sf = df["stress_MPa"].to_numpy()[sl]
-
+        sig = df["stress_MPa"].to_numpy()
+        sl = slice(0, int(np.nanargmax(sig)) + 1)
         row = scalars.loc[cid]
         coupons.append({
-            "cid": cid,
-            "exp": exp,
-            "d_str": d_str,
-            "d_int": int(d_str),
-            "eps_plot": ef,
-            "sig_plot": sf,
+            "cid": cid, "exp": exp, "d_str": d_str, "d_int": int(d_str),
+            "eps_plot": df["strain_axial"].to_numpy()[sl],
+            "sig_plot": sig[sl],
             "UTS_MPa": float(row["UTS_MPa"]),
             "E_GPa": float(row["E_GPa"]),
         })
         print(f"[{cid}]  UTS={coupons[-1]['UTS_MPa']:.1f} MPa  "
               f"E={coupons[-1]['E_GPa']:.2f} GPa")
-
     print(f"\n{len(coupons)} DIC coupons loaded (group plots)\n")
     return coupons
 
-def group_plot_dic_curves(coupons):
-    exp_active = [e for e in EXPOSURE_COLORS if EXPOSURES.get(e)]
-    dirs_present = sorted({c["d_int"] for c in coupons})
-    if not dirs_present:
-        print("No DIC coupons found; skipping group curves.")
-        return
 
+def group_plot_dic_curves(coupons):
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for c in coupons:
         col = EXPOSURE_COLORS[c["exp"]]
-        ax.plot(c["eps_plot"] * 100, c["sig_plot"],
-                color=col, ls="-", lw=0.9, alpha=0.75)
-        ax.scatter(c["eps_plot"][-1] * 100, c["sig_plot"][-1],
-                   color=col, marker=DIRECTION_MARKERS[c["d_str"]],
-                   s=35, zorder=5)
+        ax.plot(c["eps_plot"] * 100, c["sig_plot"], color=col,
+                ls=DIR_STYLES[c["d_int"]], lw=0.9, alpha=0.75)
+        ax.scatter(c["eps_plot"][-1] * 100, c["sig_plot"][-1], color=col,
+                   marker=DIRECTION_MARKERS[c["d_str"]], s=35, zorder=5)
 
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
@@ -472,12 +387,13 @@ def group_plot_dic_curves(coupons):
     ax.set_title("P01 — Tensile: Stress vs. Strain", fontsize=13)
     ax.grid(alpha=0.25, ls="--")
 
+    exp_active = [e for e in EXPOSURE_ORDER if EXPOSURES.get(e)]
     handles = [mpatches.Patch(color=EXPOSURE_COLORS[e], label=EXPOSURE_LABELS[e])
                for e in exp_active]
-    for d_int in dirs_present:
+    for d_int in sorted({c["d_int"] for c in coupons}):
         handles.append(mlines.Line2D([], [], color="k", ls="None",
-                                     marker=DIRECTION_MARKERS[f"{d_int:02d}"], markersize=6,
-                                     label=f"{d_int}°"))
+                                     marker=DIRECTION_MARKERS[f"{d_int:02d}"],
+                                     markersize=6, label=f"{d_int}°"))
     ax.legend(handles=handles, fontsize=9, loc="upper left", framealpha=0.85)
 
     fig.tight_layout()
@@ -486,28 +402,22 @@ def group_plot_dic_curves(coupons):
     plt.close(fig)
     print(f"Saved → {out}")
 
+
 def group_plot_dic_property_scatter(coupons):
     dirs_present = sorted({c["d_int"] for c in coupons})
-    if not dirs_present:
-        print("No DIC coupons found; skipping property scatter.")
-        return
-
-    exp_active = [e for e in EXPOSURE_COLORS if EXPOSURES.get(e)]
-    prop_keys = ["UTS_MPa", "E_GPa"]
-    ylabels = ["UTS (MPa)", "E (GPa)"]
-    titles = ["Ultimate Tensile Strength", "Young's Modulus"]
-    airtech = [AIRTECH_UTS, AIRTECH_E]
+    exp_active = [e for e in EXPOSURE_ORDER if EXPOSURES.get(e)]
+    panels = [("UTS_MPa", "UTS (MPa)", "Ultimate Tensile Strength", AIRTECH_UTS),
+              ("E_GPa", "E (GPa)", "Young's Modulus", AIRTECH_E)]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.8))
-    for ax, key, ylabel, title, refs in zip(axes, prop_keys, ylabels, titles, airtech):
+    for ax, panel in zip(axes, panels):
+        key, ylabel, title, refs = panel
         for c in coupons:
             ei = exp_active.index(c["exp"])
             x = c["d_int"] + (ei - (len(exp_active) - 1) / 2) * 1.5
-            ax.scatter(x, c[key],
-                       color=EXPOSURE_COLORS[c["exp"]],
-                       marker=DIRECTION_MARKERS.get(c["d_str"], "o"),
-                       s=55, zorder=5)
-        for d_int, ref in refs.items():
+            ax.scatter(x, c[key], color=EXPOSURE_COLORS[c["exp"]],
+                       marker=DIRECTION_MARKERS.get(c["d_str"], "o"), s=55, zorder=5)
+        for ref in refs.values():
             if ref is not None:
                 ax.axhline(ref, color="grey", ls="--", lw=0.8, alpha=0.6)
         ax.set_xticks(dirs_present)
@@ -526,12 +436,8 @@ def group_plot_dic_property_scatter(coupons):
     plt.close(fig)
     print(f"Saved → {out}")
 
-def group_plot_dic_peak_strength(coupons):
-    exp_active = [e for e in EXPOSURE_ORDER if EXPOSURES.get(e)]
-    if not exp_active:
-        print("No DIC exposures enabled; skipping peak strength plot.")
-        return
 
+def group_plot_dic_peak_strength(coupons):
     x_pos = np.arange(len(EXPOSURE_ORDER))
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.axvspan(x_pos[0] - 0.5, x_pos[1] + 0.5, color="#f7f5e8", alpha=0.35)
@@ -539,12 +445,11 @@ def group_plot_dic_peak_strength(coupons):
 
     for c in coupons:
         x = x_pos[EXPOSURE_ORDER.index(c["exp"])]
-        ax.scatter(x, c["UTS_MPa"],
-                   color=EXPOSURE_COLORS[c["exp"]],
+        ax.scatter(x, c["UTS_MPa"], color=EXPOSURE_COLORS[c["exp"]],
                    marker=DIRECTION_MARKERS.get(c["d_str"], "o"),
                    s=70, edgecolor="black", linewidth=0.4, zorder=5)
 
-    for d_str in ["00", "45", "90"]:
+    for d_str in DIRECTIONS:
         vals = [c["UTS_MPa"] for c in coupons if c["d_str"] == d_str]
         if vals:
             ax.axhline(np.mean(vals), color="k", ls="--", lw=0.7, alpha=0.6, zorder=3)
@@ -557,10 +462,11 @@ def group_plot_dic_peak_strength(coupons):
     ax.set_title("P01 — Tensile: Max Stress")
     ax.grid(alpha=0.25, ls="--", axis="y")
 
-    dir_handles = [mlines.Line2D([], [], color="black", marker=DIRECTION_MARKERS[d], linestyle="None",
-                                 markersize=7, label=f"{d}°")
-                   for d in ["00", "45", "90"] if DIRECTIONS.get(d)]
-    ax.legend(handles=dir_handles, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+    handles = [mlines.Line2D([], [], color="black", marker=DIRECTION_MARKERS[d],
+                             linestyle="None", markersize=7, label=f"{d}°")
+               for d in DIRECTIONS if DIRECTIONS.get(d)]
+    ax.legend(handles=handles, fontsize=8, loc="upper left",
+              bbox_to_anchor=(1.02, 1), borderaxespad=0)
 
     fig.tight_layout()
     out = FIGS_ROOT / "tensile_peak_strength_DIC.png"
@@ -570,57 +476,133 @@ def group_plot_dic_peak_strength(coupons):
 
 
 # =============================================================================
-# PRINT STATS — mean ± std (CV%) tables, tensile (D638) + bearing (D953)
+# STATS — mean +/- std (CV%) tables
 # =============================================================================
-def load_spec_sheet_raw() -> pd.DataFrame:
-    """Full specimen sheet with its original headers (not renamed), indexed by
-    Specimen ID — needed here for coupon thickness (bearing area) as well as
-    the tensile scalar columns."""
+def stat(vals):
+    """(mean, std, CV%) of the finite values; NaN for an empty group."""
+    arr = np.array([v for v in vals if v is not None and np.isfinite(v)], dtype=float)
+    if len(arr) == 0:
+        return np.nan, np.nan, np.nan
+    m = float(np.mean(arr))
+    s = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+    cv = 100.0 * s / abs(m) if abs(m) > 1e-12 else 0.0
+    return m, s, cv
+
+def stat_cell(m, s, cv, w_m=6, w_s=5, dec_m=2, dec_s=2):
+    if not np.isfinite(m):
+        return f"{'NaN':>{w_m}} ± {'NaN':>{w_s}} (  N/A)"
+    return f"{m:{w_m}.{dec_m}f} ± {s:{w_s}.{dec_s}f} ({cv:4.1f}%)"
+
+def stat_groups(rows_data, exp_order, directions, exp_labels):
+    """(label, direction, subset) per exposure x direction, then All exps per direction."""
+    groups = []
+    for exp in exp_order:
+        for d in directions:
+            groups.append((exp_labels.get(exp, exp), d,
+                           [r for r in rows_data if r["exp"] == exp and r["dir"] == d]))
+    for d in directions:
+        groups.append(("All exps", d, [r for r in rows_data if r["dir"] == d]))
+    return groups
+
+def print_table(title, rows_data, exp_order, directions, props, exp_labels):
+    """props : list of (key, header, dec_m, dec_s, w_m, w_s)"""
+    col_w, id_w = 22, 24
+    bar = "=" * (id_w + col_w * len(props))
+    sep = "-" * (id_w + col_w * len(props))
+
+    print(f"\n{title}")
+    print(bar)
+    print(f"{'Exposure':<12s} {'Dir':>6s}  {'n':3s}   "
+          + "".join(f"{p[1]:^{col_w}}" for p in props))
+    print(f"{'':12s} {'':6s}  {'':3s}   "
+          + "".join(f"{'mean ± std (CV%)':^{col_w}}" for _ in props))
+    print(sep)
+
+    groups = stat_groups(rows_data, exp_order, directions, exp_labels)
+    for i, (label, d, subset) in enumerate(groups):
+        if i == len(groups) - len(directions):
+            print(sep)
+        if not subset:
+            continue
+        cells = []
+        for key, _, dec_m, dec_s, w_m, w_s in props:
+            m, s, cv = stat([r[key] for r in subset])
+            cells.append(stat_cell(m, s, cv, w_m, w_s, dec_m, dec_s).ljust(col_w - 3))
+        d_label = f"{d}°"
+        print(f"{label:<12s} {d_label:>6s}  {len(subset):3d}   " + "   ".join(cells))
+    print(bar)
+
+def build_stats_df(rows_data, exp_order, directions, props, exp_labels):
+    """mean/std/CV columns per group, plus an 'All exps' row per direction."""
+    records = []
+    for label, d, subset in stat_groups(rows_data, exp_order, directions, exp_labels):
+        if not subset:
+            continue
+        rec = {"Exposure": label, "Dir (deg)": d, "n": len(subset)}
+        for key, header, *_ in props:
+            m, s, cv = stat([r[key] for r in subset])
+            rec[header + " mean"]   = round(m, 4) if np.isfinite(m) else None
+            rec[header + " std"]    = round(s, 4) if np.isfinite(s) else None
+            rec[header + " CV (%)"] = round(cv, 2) if np.isfinite(cv) else None
+        records.append(rec)
+    return pd.DataFrame(records)
+
+def write_stats_sheet(path, sheet, df):
+    """Write df to one sheet of the workbook, leaving the other sheets alone.
+    FlexuralDIC_Level3 writes a Flexural sheet into this same file."""
+    if path.exists():
+        writer = pd.ExcelWriter(path, engine="openpyxl", mode="a",
+                                if_sheet_exists="replace")
+    else:
+        writer = pd.ExcelWriter(path, engine="openpyxl", mode="w")
+    with writer:
+        df.to_excel(writer, sheet_name=sheet, index=False)
+
+
+# =============================================================================
+# STATS — tensile rows (D638) and bearing rows (D953)
+# =============================================================================
+def load_spec_sheet_raw():
+    """Specimen sheet with its original headers, indexed by Specimen ID —
+    needed for coupon thickness (bearing area) as well as the tensile scalars."""
     df = read_specimen_csv()
     if "Print ID" in df.columns:
         df = df[df["Print ID"] == PRINTS[0]]
-    if "Specimen ID" in df.columns:
-        df = df.set_index("Specimen ID")
-    return df
+    return df.set_index("Specimen ID")
 
-def load_tensile_stats_rows(spec_df: pd.DataFrame) -> list[dict]:
+def load_tensile_stats_rows(spec_df):
     rows = []
-    for exp in EXPOSURE_ORDER:
-        for d in T_DIRECTIONS:
-            for rep in REPLICATES:
-                cid = f"{PRINTS[0]}-T{exp}{d:02d}-{rep}"
-                if cid in DIC_EXCLUDE or cid not in spec_df.index:
-                    continue
-                spec_row = spec_df.loc[cid]
-                # Individual properties (e.g. sigma_y for a brittle 90° coupon
-                # with no offset-yield crossing) may legitimately be NaN —
-                # stat() already drops NaN per-property, so only skip the
-                # whole coupon if E_GPa itself (needed for every coupon) is missing.
-                cols = {k: spec_row.get(v) for k, v in SPECIMEN_SHEET_COLUMNS.items()}
-                cols = {k: (float(v) if pd.notna(v) else np.nan) for k, v in cols.items()}
-                if np.isnan(cols["E_GPa"]):
-                    continue
-                rows.append({
-                    "exp": exp,
-                    "dir": d,
-                    "cid": cid,
-                    "E_GPa":          cols["E_GPa"],
-                    "sigma_y_MPa":    cols["sigma_y_MPa"],
-                    "UTS_MPa":        cols["UTS_MPa"],
-                    "eps_at_UTS_pct": cols["eps_at_UTS"] * 100.0,
-                    "poisson_chord":  cols["poisson_chord"],
-                })
+    for cid in selected_coupons():
+        if cid in DIC_EXCLUDE or cid not in spec_df.index:
+            continue
+        spec_row = spec_df.loc[cid]
+        cols = {}
+        for key, label in SPECIMEN_SHEET_COLUMNS.items():
+            v = spec_row.get(label)
+            cols[key] = float(v) if pd.notna(v) else np.nan
+        # Individual properties can legitimately be NaN (a brittle 90 deg coupon
+        # has no offset-yield crossing); stat() drops those per property. Only
+        # E_GPa missing means the coupon has not been through Level 2 at all.
+        if np.isnan(cols["E_GPa"]):
+            continue
+        exp, d_str = parse_id(cid)
+        rows.append({
+            "exp": exp, "dir": int(d_str), "cid": cid,
+            "E_GPa":          cols["E_GPa"],
+            "sigma_y_MPa":    cols["sigma_y_MPa"],
+            "UTS_MPa":        cols["UTS_MPa"],
+            "eps_at_UTS_pct": cols["eps_at_UTS"] * 100.0,
+            "poisson_chord":  cols["poisson_chord"],
+        })
     return rows
 
-def load_tensile_fmax() -> dict[str, float]:
-    """Peak load per tensile coupon, read directly from the raw MTS .txt
-    files (independent of the DIC pipeline)."""
-    fmax: dict[str, float] = {}
+def load_tensile_fmax():
+    """Peak load per tensile coupon, straight from the raw MTS files."""
+    fmax = {}
     for fp in sorted(MTS_DIR.glob(f"{PRINTS[0]}-T*.txt")):
-        stem = re.sub(r"\.txt$", "", fp.name, flags=re.IGNORECASE)
-        stem_clean = re.sub(r"-TEST$", "", stem, flags=re.IGNORECASE)
-        parts = stem_clean.split("-")
-        if len(parts) < 3 or not parts[1].upper().startswith("T") or len(parts[1]) < 5:
+        stem = re.sub(r"-TEST$", "", fp.stem, flags=re.IGNORECASE)
+        parts = stem.split("-")
+        if len(parts) < 3 or len(parts[1]) < 5 or not parts[2].isdigit():
             continue
         key = parts[1].upper()
         exp_code = key[1:-2]
@@ -630,21 +612,14 @@ def load_tensile_fmax() -> dict[str, float]:
             continue
         if exp_code not in EXPOSURE_LABELS or d_int not in T_DIRECTIONS:
             continue
-        rep_str = parts[2]
-        if not rep_str.isdigit():
-            continue
-        cid = f"{PRINTS[0]}-T{exp_code}{d_int:02d}-{int(rep_str):02d}"
-
-        raw = pd.read_csv(fp, sep="\t", skiprows=MTS_HEADERS, header=None,
-                          names=["disp_mm", "force_N", "output_V", "time_s"],
-                          encoding="utf-8-sig", on_bad_lines="skip")
-        raw = raw.apply(pd.to_numeric, errors="coerce").dropna(subset=["force_N"])
+        raw = read_mts_txt(fp).dropna(subset=["force_N"])
         if len(raw) < 10:
             continue
+        cid = f"{PRINTS[0]}-T{exp_code}{d_int:02d}-{int(parts[2]):02d}"
         fmax[cid] = float(np.max(raw["force_N"].to_numpy()))
     return fmax
 
-def get_t_mm(spec_df: pd.DataFrame, t_col: str | None, sid: str) -> float | None:
+def get_t_mm(spec_df, t_col, sid):
     if t_col is None or sid not in spec_df.index:
         return None
     v = spec_df.loc[sid, t_col]
@@ -652,7 +627,7 @@ def get_t_mm(spec_df: pd.DataFrame, t_col: str | None, sid: str) -> float | None
         v = v.iloc[0]
     return float(v) * 25.4 if pd.notna(v) else None
 
-def parse_bearing_stem(stem: str):
+def parse_bearing_stem(stem):
     """Return (exp_code, d_int, spec_id) or (None, None, None)."""
     canon = re.sub(r"-TEST$", "", stem, flags=re.IGNORECASE)
     if canon.upper() == SUBST_SRC:
@@ -668,19 +643,18 @@ def parse_bearing_stem(stem: str):
         return None, None, None
     if exp_code not in EXPOSURE_LABELS or d_int not in B_DIRECTIONS:
         return None, None, None
-    base = f"{PRINTS[0]}-B{exp_code}{d_int:02d}"
-    rep_part = ""
+    rep = ""
     if len(parts) >= 3:
         p3 = re.sub(r"^TEST", "", parts[2], flags=re.IGNORECASE)
         if p3.isdigit():
-            rep_part = p3
-    spec_id = f"{base}-{int(rep_part):02d}" if rep_part else base
-    return exp_code, d_int, spec_id
+            rep = p3
+    base = f"{PRINTS[0]}-B{exp_code}{d_int:02d}"
+    return exp_code, d_int, (f"{base}-{int(rep):02d}" if rep else base)
 
-def load_bearing_rows(spec_df: pd.DataFrame, t_col: str | None) -> list[dict]:
+def load_bearing_rows(spec_df, t_col):
     rows = []
     for fp in sorted(MTS_DIR.glob(f"{PRINTS[0]}-B*.txt")):
-        stem = re.sub(r"\.txt$", "", fp.name, flags=re.IGNORECASE)
+        stem = fp.stem
         if stem.upper() in {s.upper() for s in SKIP_BEAR}:
             continue
         exp_code, d_int, spec_id = parse_bearing_stem(stem)
@@ -690,139 +664,38 @@ def load_bearing_rows(spec_df: pd.DataFrame, t_col: str | None) -> list[dict]:
         if t_mm is None:
             continue
 
-        raw = pd.read_csv(fp, sep="\t", skiprows=MTS_HEADERS, header=None,
-                          names=["disp_mm", "force_N", "output_V", "time_s"],
-                          encoding="utf-8-sig", on_bad_lines="skip")
-        raw = raw.apply(pd.to_numeric, errors="coerce").dropna(subset=["disp_mm", "force_N"])
+        raw = read_mts_txt(fp).dropna(subset=["disp_mm", "force_N"])
         if len(raw) < 10:
             continue
-
         d = raw["disp_mm"].to_numpy() - raw["disp_mm"].iloc[0]
         f = raw["force_N"].to_numpy()
         F_max = float(np.max(f))
 
-        # Toe correction (D953 Appendix X1 tangent-method equivalent):
-        # Fit a line to the 10-40% F_max region and project back to F = 0.
-        # That x-intercept is the toe offset (machine take-up).
+        # Toe correction (D953 Appendix X1): fit the 10-40 % F_max region and
+        # project back to F = 0. That x-intercept is the machine take-up.
         fit_m = (f >= FIT_LO * F_max) & (f <= FIT_HI * F_max)
         if fit_m.sum() < 3:
             continue
         slope, intercept = np.polyfit(d[fit_m], f[fit_m], 1)
         d_corr = d - (-intercept / slope)
 
-        # P at 4% hole deformation (D953-19 §3.2.2): only pre-peak data,
-        # enforced monotone for interp.
+        # P at 4 % hole deformation (D953-19 3.2.2): pre-peak only, made
+        # monotone so np.interp is valid.
         i_max = int(np.argmax(f))
         dc, fc = d_corr[:i_max + 1], f[:i_max + 1]
-        cum_m  = np.maximum.accumulate(dc)
-        keep   = np.concatenate(([True], np.diff(cum_m) > 0))
+        keep = np.concatenate(([True], np.diff(np.maximum.accumulate(dc)) > 0))
         dc_m, fc_m = dc[keep], fc[keep]
         failed = float(np.max(dc_m)) < DEF_4PCT_MM
         P_4pct = F_max if failed else float(np.interp(DEF_4PCT_MM, dc_m, fc_m))
 
-        area = t_mm * HOLE_D_MM   # D953-19 §13.3
-        rows.append({
-            "exp":     exp_code,
-            "dir":     d_int,
-            "cid":     spec_id,
-            "F_max_N": F_max,
-            "S_b":     P_4pct / area,   # D953-19 §13.3 Eq. 1
-            "S_max":   F_max  / area,   # D953-19 §3.2.5
-            "failed":  failed,
-        })
+        area = t_mm * HOLE_D_MM       # D953-19 13.3
+        rows.append({"exp": exp_code, "dir": d_int, "cid": spec_id,
+                     "F_max_N": F_max,
+                     "S_b":    P_4pct / area,    # D953-19 13.3 Eq. 1
+                     "S_max":  F_max / area,     # D953-19 3.2.5
+                     "failed": failed})
     return rows
 
-def stat(vals: list) -> tuple[float, float, float]:
-    """Return (mean, std, cv%) from a list; NaN for invalid/empty groups."""
-    arr = np.array([v for v in vals if v is not None and np.isfinite(v)], dtype=float)
-    if len(arr) == 0:
-        return np.nan, np.nan, np.nan
-    m = float(np.mean(arr))
-    s = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-    cv = 100.0 * s / abs(m) if abs(m) > 1e-12 else 0.0
-    return m, s, cv
-
-def stat_cell(m, s, cv, w_m=6, w_s=5, dec_m=2, dec_s=2) -> str:
-    """Format one statistic cell: 'mean ± std (CV%)'."""
-    if not np.isfinite(m):
-        return f"{'NaN':>{w_m}} ± {'NaN':>{w_s}} (  N/A)"
-    return f"{m:{w_m}.{dec_m}f} ± {s:{w_s}.{dec_s}f} ({cv:4.1f}%)"
-
-def stat_row(label_exp, label_dir, n, cells: list[str]) -> str:
-    return f"{label_exp:<12s} {label_dir:>6s}  {n:3d}   " + "   ".join(cells)
-
-def print_table(title: str, rows_data: list[dict], exp_order: list[str],
-                directions: list[int], props: list[tuple],
-                exp_labels: dict[str, str]) -> None:
-    """props : list of (key, header, dec_m, dec_s, w_m, w_s)"""
-    col_w = 20   # width of each stat column (including padding)
-    id_w  = 24   # width of 'Exposure Dir n' prefix
-
-    bar  = "=" * (id_w + col_w * len(props))
-    sep  = "-" * (id_w + col_w * len(props))
-    hdrs = "".join(f"{p[1]:^{col_w}}" for p in props)
-    cv_h = "".join(f"{'mean ± std (CV%)':^{col_w}}" for p in props)
-
-    print(f"\n{title}")
-    print(bar)
-    print(f"{'Exposure':<12s} {'Dir':>6s}  {'n':3s}   " + hdrs)
-    print(f"{'':12s} {'':6s}  {'':3s}   " + cv_h)
-    print(sep)
-
-    def print_group(label_exp, label_dir, subset):
-        n = len(subset)
-        if n == 0:
-            return
-        cells = []
-        for key, _, dec_m, dec_s, w_m, w_s in props:
-            vals = [r[key] for r in subset]
-            m, s, cv = stat(vals)
-            cells.append(stat_cell(m, s, cv, w_m, w_s, dec_m, dec_s).ljust(col_w - 3))
-        print(stat_row(label_exp, label_dir, n, cells))
-
-    for exp in exp_order:
-        for d in directions:
-            subset = [r for r in rows_data if r["exp"] == exp and r["dir"] == d]
-            print_group(exp_labels.get(exp, exp), f"{d}°", subset)
-
-    print(sep)
-    for d in directions:
-        subset = [r for r in rows_data if r["dir"] == d]
-        print_group("All exps", f"{d}°", subset)
-
-    print(bar)
-
-def build_stats_df(rows_data: list[dict], exp_order: list[str],
-                   directions: list[int], props: list[tuple],
-                   exp_labels: dict[str, str]) -> pd.DataFrame:
-    """Build a DataFrame with mean/std/CV columns for each property."""
-    records = []
-    for exp in exp_order:
-        for d in directions:
-            subset = [r for r in rows_data if r["exp"] == exp and r["dir"] == d]
-            if not subset:
-                continue
-            rec = {"Exposure": exp_labels.get(exp, exp), "Dir (deg)": d, "n": len(subset)}
-            for key, header, *_ in props:
-                vals = [r[key] for r in subset]
-                m, s, cv = stat(vals)
-                rec[f"{header} mean"]   = round(m, 4) if np.isfinite(m) else None
-                rec[f"{header} std"]    = round(s, 4) if np.isfinite(s) else None
-                rec[f"{header} CV (%)"] = round(cv, 2) if np.isfinite(cv) else None
-            records.append(rec)
-    for d in directions:
-        subset = [r for r in rows_data if r["dir"] == d]
-        if not subset:
-            continue
-        rec = {"Exposure": "All exps", "Dir (deg)": d, "n": len(subset)}
-        for key, header, *_ in props:
-            vals = [r[key] for r in subset]
-            m, s, cv = stat(vals)
-            rec[f"{header} mean"]   = round(m, 4) if np.isfinite(m) else None
-            rec[f"{header} std"]    = round(s, 4) if np.isfinite(s) else None
-            rec[f"{header} CV (%)"] = round(cv, 2) if np.isfinite(cv) else None
-        records.append(rec)
-    return pd.DataFrame(records)
 
 def run_print_stats():
     spec_df = load_spec_sheet_raw()
@@ -832,49 +705,42 @@ def run_print_stats():
     fmax = load_tensile_fmax()
     for r in tensile_rows:
         r["F_max_N"] = fmax.get(r["cid"])
-
     bearing_rows = load_bearing_rows(spec_df, t_col)
 
-    #  (key,            header,        dec_m, dec_s, w_m, w_s)
+    #             (key,            header,        dec_m, dec_s, w_m, w_s)
     tensile_props = [
-        ("E_GPa",          "E (GPa)",   2, 2, 5, 4),
+        ("E_GPa",          "E (GPa)",     2, 2, 5, 4),
         ("sigma_y_MPa",    "σ_y (MPa)", 1, 1, 5, 4),
-        ("UTS_MPa",        "UTS (MPa)", 1, 1, 5, 4),
+        ("UTS_MPa",        "UTS (MPa)",   1, 1, 5, 4),
         ("eps_at_UTS_pct", "ε_UTS (%)", 2, 2, 4, 4),
-        ("poisson_chord",  "ν_chord",   3, 3, 5, 5),
-        ("F_max_N",        "F_max (N)", 1, 1, 6, 5),
+        ("poisson_chord",  "ν_chord",    3, 3, 5, 5),
+        ("F_max_N",        "F_max (N)",   1, 1, 6, 5),
     ]
-    print_table(
-        title="TENSILE MECHANICAL PROPERTIES — ASTM D638-14",
-        rows_data=tensile_rows, exp_order=EXPOSURE_ORDER, directions=T_DIRECTIONS,
-        props=tensile_props, exp_labels=EXPOSURE_LABELS,
-    )
+    print_table("TENSILE MECHANICAL PROPERTIES — ASTM D638-14",
+                tensile_rows, EXPOSURE_ORDER, T_DIRECTIONS,
+                tensile_props, EXPOSURE_LABELS)
 
     bearing_props = [
         ("F_max_N", "F_max (N)",   1, 1, 6, 5),
         ("S_b",     "S_b (MPa)",   1, 1, 5, 4),
         ("S_max",   "S_max (MPa)", 1, 1, 5, 4),
     ]
-    print_table(
-        title="\nPIN-BEARING PROPERTIES — ASTM D953-19 Procedure A",
-        rows_data=bearing_rows, exp_order=EXPOSURE_ORDER, directions=B_DIRECTIONS,
-        props=bearing_props, exp_labels=EXPOSURE_LABELS,
-    )
+    print_table("\nPIN-BEARING PROPERTIES — ASTM D953-19 Procedure A",
+                bearing_rows, EXPOSURE_ORDER, B_DIRECTIONS,
+                bearing_props, EXPOSURE_LABELS)
 
     n_failed = sum(r["failed"] for r in bearing_rows)
     if n_failed:
         print(f"\n  Note: {n_failed} coupon(s) failed before reaching 4% hole deformation.")
-        print( "        For those, P_4pct = F_max (conservative upper bound for S_b).")
+        print("        For those, P_4pct = F_max (conservative upper bound for S_b).")
 
-    df_tensile = build_stats_df(tensile_rows, EXPOSURE_ORDER, T_DIRECTIONS,
-                                 tensile_props, EXPOSURE_LABELS)
-    df_bearing = build_stats_df(bearing_rows, EXPOSURE_ORDER, B_DIRECTIONS,
-                                 bearing_props, EXPOSURE_LABELS)
-
-    with pd.ExcelWriter(OUT_STATS_XLSX, engine="openpyxl") as writer:
-        df_tensile.to_excel(writer, sheet_name="Tensile", index=False)
-        df_bearing.to_excel(writer, sheet_name="Bearing", index=False)
-    print(f"\nExported: {OUT_STATS_XLSX}")
+    write_stats_sheet(OUT_STATS_XLSX, "Tensile",
+                      build_stats_df(tensile_rows, EXPOSURE_ORDER, T_DIRECTIONS,
+                                     tensile_props, EXPOSURE_LABELS))
+    write_stats_sheet(OUT_STATS_XLSX, "Bearing",
+                      build_stats_df(bearing_rows, EXPOSURE_ORDER, B_DIRECTIONS,
+                                     bearing_props, EXPOSURE_LABELS))
+    print(f"\nExported: {OUT_STATS_XLSX} [Tensile, Bearing]")
 
 
 # =============================================================================
@@ -890,21 +756,20 @@ def main():
         for cid in selected_coupons():
             props = load_props(cid, scalars)
             if props is None:
-                print(f"[{cid}] no per-coupon CSV, no kept rows, or no specimen-sheet row — run Level 2 first")
+                print(f"[{cid}] no per-coupon CSV, no kept rows, or no specimen-sheet "
+                      f"row — run Level 2 first")
                 continue
-
             print(f"[{cid}]  E={props['E_GPa']:.2f} GPa  "
                   f"σ_y={props['sigma_y_MPa']:.1f} MPa  "
                   f"UTS={props['UTS_MPa']:.1f} MPa  "
-                  f"ε_UTS={props['eps_at_UTS']*100:.2f}%  "
+                  f"ε_UTS={props['eps_at_UTS'] * 100:.2f}%  "
                   f"ν_chord={props['poisson_chord']:.3f}")
-
             fig_dir = FIGS_ROOT / cid
             fig_dir.mkdir(parents=True, exist_ok=True)
             plot_stress_strain(cid, props, fig_dir)
             plot_poisson(cid, props, fig_dir)
             n_plotted += 1
-        print(f"\n{n_plotted} coupon(s) plotted -> {FIGS_ROOT}")
+        print(f"\n{n_plotted} coupon(s) plotted → {FIGS_ROOT}")
 
     if DO_GROUP_PLOTS:
         mts_coupons = group_load_mts_coupons()
@@ -924,7 +789,7 @@ def main():
     if DO_PRINT_STATS:
         run_print_stats()
 
-    print(f"\nDone. {time.time()-t0:.1f} s")
+    print(f"\nDone. {time.time() - t0:.1f} s")
 
 
 if __name__ == "__main__":

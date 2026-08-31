@@ -256,15 +256,37 @@ the fast one):
 
 ### Level 2 — `TensileDIC_Level2.py`
 
-Reads Level-1's per-coupon CSVs, scales raw load to force/stress, applies
-failure truncation, and computes ASTM D638 mechanical properties. No
+Reads Level-1's per-coupon CSVs, puts the raw MTS force onto the DIC frames,
+applies failure truncation, and computes ASTM D638 mechanical properties. No
 plotting here (see Level 3).
 
 **What it does**
-- Scales `load_raw` to `force_N` by **regressing the raw MTS force against
-  `load_raw` over the rising ramp** (10–85 % of peak), using every point in it
-  — `LOAD_SCALE_MODE = "regress"`. It divides by `area_mm2` (from
-  `coupon_scalars.csv`) to get `stress_MPa`.
+- **Takes force straight from the MTS record, peak-anchored.** The sync CSV and
+  the raw MTS file don't share a clock, so the sync CSV's peak-force row and
+  the raw MTS peak-force row are treated as the same physical instant, and MTS
+  force and displacement are interpolated at each DIC frame's offset from that
+  anchor. Dividing by `area_mm2` (from `coupon_scalars.csv`) gives
+  `stress_MPa`; the mapped displacement is kept as its own `disp_mm_mts`
+  column, leaving Level-1's `disp_mm` untouched.
+
+  **This is what `TensileDIC_Level2_tmp.py` used to do**, and it is now the
+  standard method — the tmp script has been retired to `old/scripts/`. The sync
+  CSV's own load channel is used *only* to locate the peak row; none of its
+  values reach a stress. That matters because this batch's analog channels are
+  unreliable (see the warning at the top of this README), and it puts the
+  trustworthy MTS channel behind the whole curve rather than just its peak.
+
+  What this replaced was a `load_raw x scale` approach, where the scale came
+  from regressing MTS force against the sync load channel over the rising ramp.
+  That is still the right idea for a batch whose sync load channel is properly
+  calibrated, and the reasoning and the measurements behind it are kept below,
+  because they are what justified distrusting the peak ratio in the first
+  place. It is no longer in the script.
+
+<details>
+<summary>Retired: the regressed load scale (kept for the record)</summary>
+
+
 
   **Why this replaced the peak ratio.** The old rule
   (`mts_peak_N / max(|load_raw|)`, still available as
@@ -293,9 +315,17 @@ plotting here (see Level 3).
   (true lags −12.3, −6.0, −5.5 s) and returns a scale 5–17 % wrong while R²
   stays at 0.996–0.997 — so an R²-only guard passes it. A railed optimum is
   detected explicitly and falls back to the peak ratio rather than being used.
-- **Checks DIC coverage** (`DIC_COVERAGE_MIN = 0.98`): the largest MTS force
-  the DIC record actually spans, as a fraction of the MTS peak. Below that, the
-  sync CSV stopped before the specimen did — see the warning at the top of this
+
+</details>
+
+- **Checks DIC coverage** (`DIC_COVERAGE_MIN = 0.98`). With force now anchored
+  at the peak, coverage can no longer be read off a regression, so it is
+  measured a way that does not need the sync channel to be calibrated at all:
+  the load cell and DAQ gain are hardware constants, so `sync_peak / mts_peak`
+  must be the same number for every coupon in the batch, and `add_coverage()`
+  takes the batch median as the nominal gain and reports each coupon against
+  it. A coupon that reads low did not record its own peak. Below the threshold
+  the sync CSV stopped before the specimen did — see the warning at the top of this
   README for the three P01 coupons this catches. Recorded per coupon in the
   workbook.
 - Truncates each record: marks pre-load slack and post-fracture rebound (first
@@ -797,11 +827,30 @@ modulus.
   would overwrite the tensile one. Each script replaces only its own test's rows
   and reads the other's back unchanged.
 
-### Level 3 — not written yet
+### Level 3 — `FlexuralDIC_Level3.py`
 
-There is no `FlexuralDIC_Level3.py`. Plot from `<DIC_DIR>/<coupon_id>.csv`
-(`kept == True` rows) and the `Flex …` columns of `FSR-SpecimenTesting.xlsx`
-until there is — the same two sources `TensileDIC_Level3.py` reads.
+Plots and statistics only, built to the same shape as `TensileDIC_Level3.py`:
+it reads `<DIC_DIR>/<coupon_id>.csv` (`kept == True` rows) and the `Flex …`
+columns of `FSR-SpecimenTesting.csv`, and recomputes nothing.
+
+Per coupon, into `figs/<coupon_id>/`:
+
+- `flexural_stress_strain_DIC.png` — σ_f against curvature strain, truncated at
+  peak stress, with the tangent-modulus line and the strength marker.
+- `flexural_strain_channels_DIC.png` — all three strain channels on one stress
+  axis. This is the figure that shows the channel gaps directly, so it is the
+  flexural analogue of the tensile Poisson plot rather than a copy of it.
+
+Group figures, into `figs/`: `flexural_mts_FD.png` (raw MTS force against
+displacement, tare removed by the same detector Level 1 uses),
+`flexural_curves_DIC.png`, `flexural_summary_DIC.png` and
+`flexural_peak_strength_DIC.png`.
+
+**It appends to `P01_MechanicalStats.xlsx` rather than replacing it.** Both
+Level 3s now open that workbook with `mode="a", if_sheet_exists="replace"`, so
+the tensile run writes `Tensile` and `Bearing`, the flexural run writes
+`Flexural`, and neither destroys the other's sheets. Run order does not matter,
+and the file is created on the first run if it does not exist.
 
 ### Validation
 
@@ -815,7 +864,7 @@ Levels 1–2 reproduce, exactly, the numbers from the earlier standalone
 | MTS clock leads frames by | 25.81 s |
 | analysis window | frames 141–847, 707 of 881 kept |
 | flexural strength `σ_fM` | 117.2 MPa at 2.61 % strain |
-| `E_f` curvature / deflection / crosshead / (M/I)-vs-κ | 7.94 / 7.08 / 6.93 / 7.99 GPa |
+| `E_f` curvature / deflection / crosshead / (M/I)-vs-κ | 7.97 / 7.25 / 7.12 / 7.96 GPa |
 | through-depth fit R² | 0.9992 median above 25 % load |
 
 **All 12 coupons have been run.** Nine processed cleanly; the three listed under
@@ -825,13 +874,14 @@ travels across coupons — mean ± std:
 
 | | n | `σ_fM` (MPa) | `E_f` curvature (GPa) | `E_f` deflection | `E_f` crosshead | strain at max |
 |---|---|---|---|---|---|---|
-| **0°** | 5 | 115.3 ± 3.7 | 8.08 ± 0.11 | 7.35 ± 0.16 | 7.01 ± 0.12 | 2.6 % |
-| **90°** | 4 | 52.7 ± 3.9 | 4.01 ± 0.09 | 3.67 ± 0.07 | 3.47 ± 0.05 | 1.5 % |
+| **0°** | 5 | 115.3 ± 3.7 | 8.04 ± 0.06 | 7.35 ± 0.07 | 7.05 ± 0.10 | 2.6 % |
+| **90°** | 4 | 52.7 ± 3.9 | 3.98 ± 0.05 | 3.67 ± 0.07 | 3.50 ± 0.08 | 1.5 % |
 
-The curvature modulus scatters by ~1.3 % within an orientation across two
-different exposures, and the channel gaps stay consistent coupon to coupon
-(deflection −7.6 to −10.9 %, crosshead −11.7 to −15.1 %) — they are systematic,
-as the argument above says they should be, not noise. Through-depth fit R² is
+The curvature modulus scatters by 0.7 % (0°) and 1.3 % (90°) within an
+orientation across two different exposures, and the channel gaps stay
+consistent: deflection −8.6 % and crosshead −12.3 % at 0°, −7.8 % and
+−12.1 % at 90° — they are systematic, as the argument above says they should
+be, not noise. Through-depth fit R² is
 0.998–0.9996 on all nine. The 90° modulus lines up with the 3.43–3.57 GPa the
 MTS ramp slopes and the tensile workbook give for that orientation.
 
@@ -846,15 +896,21 @@ MTS ramp slopes and the tensile workbook give for that orientation.
   above). No longer needed to validate the fixture — that is confirmed — but it
   measures where the moment actually crosses zero, which is a real diagnostic of
   contact behaviour and feeds the interpretation of the channel gaps.
-- **Decide where the D790 scalars live** — their own columns in
-  `FSR-SpecimenTesting.xlsx` alongside the tensile ones, or the properties CSV
-  as now.
-- **Write Level 3** (per-coupon and group plots, stat tables), one result at a
-  time.
+- **Re-check the three ROI-blocked coupons against Level 3's group figures**
+  once their VIC-3D projects are re-aligned, since the 0° and 90° groups are
+  currently n = 5 and n = 4 rather than 6 and 6.
 
 ---
 
 ## Result — how much of the tensile modulus scatter is processing?
+
+> **Note.** This study was run against the load-scale version of Level 2, which
+> has since been replaced by the peak-anchored MTS mapping described above. Its
+> conclusions about the *modulus* knobs (fit window, truncation, toe, smoothing)
+> still hold, since none of those changed. Its conclusions about the *load
+> scale* now describe a retired code path — useful as the reasoning that led
+> here, not as a description of what Level 2 does today. Re-running it against
+> the current Level 2 has not been done.
 
 `tensile_modulus_sensitivity.py` turns every knob in the Level-2 reduction, one
 at a time and then all together, and recomputes E for each setting: 810
@@ -1107,18 +1163,39 @@ the time it runs everything it needs is already in `DIC_DIR` or the specimen
 sheet. `TensileDIC_Level2.py` **now does** need `MTS_DIR` (it regresses the load
 scale against the raw MTS record) and `DATA_ROOTS` (as a fallback clock source,
 for per-coupon CSVs written before the `time_s` fix — see the sync-CSV warning
-near the top). `TensileDIC_Level2_tmp.py` and `tensile_modulus_sensitivity.py`
-need both for the same reasons.
+near the top). `tensile_modulus_sensitivity.py` needs both for the
+same reasons.
 
 The flexural scripts follow the same shape. Their `EXPOSURES` is `{CL, IS}` and
 `DIRECTIONS` is `{00, 90}` — the other exposures and the 45° direction weren't
 bend-tested. `FlexuralDIC_Level2.py` needs only `DIC_DIR`; Level 1 needs
-`RAW_ROOT`, `MTS_DIR` and the specimen sheet.
+`RAW_ROOT`, `MTS_DIR` and the specimen sheet; Level 3 needs `FIGS_ROOT`,
+`DIC_DIR`, `MTS_DIR` and the specimen sheet.
 
-**`FLEX_SPAN_MM` is defined in both flexural levels and the two must match.**
-It is duplicated rather than shared because neither script imports the other —
-keeping each runnable on its own, the way the tensile levels are. If you change
-it, change it in both.
+**Analysis constants are duplicated across scripts on purpose, and must be
+kept in step.** No level imports another, so each stays runnable on its own;
+the cost is that the same number appears in several files. The ones that must
+agree:
+
+| constant | where | value |
+|---|---|---|
+| `FLEX_SPAN_MM` | `FlexuralDIC_Level1/2/3.py`, `mts_plots.py` | `8.00 * 25.4` |
+| `MODULUS_STRAIN_RANGE` | `TensileDIC_Level2/3.py`, `FlexuralDIC_Level2/3.py` | `(0.0005, 0.003)` |
+| `CHORD_STRAIN_RANGE` | `TensileDIC_Level2.py`, `FlexuralDIC_Level2.py` | `(0.001, 0.003)` |
+| `LOAD_START_FRAC` / `LOAD_END_FRAC` | both Level 2s | `0.02` / `0.50` |
+| `EXPOSURE_COLORS` / `DIR_STYLES` | both Level 3s, `mts_plots.py` | CVD-safe set |
+
+The two modulus windows used to differ between the pipelines (flexural ran
+`(0.0005, 0.0025)` for both tangent and chord). Unifying them moves the
+flexural tangent modulus by at most 2.3 % per coupon, median −0.7 %, and
+tightens the 0° group scatter from CV 1.3 % to 0.7 %. The chord is much more
+window-sensitive than the tangent — that is a property of this material, not of
+the change; see the tensile chord discussion above.
+
+The Level 3 colour palette is `mts_plots.py`'s, not matplotlib's `tab10`. The
+`tab10` set the older Level 3 figures used fails colour-vision separation: UV
+orange and IS green sit at OKLab ΔE 0.7 under protanopia, i.e. the same
+colour.
 
 ## File naming history
 
@@ -1127,6 +1204,11 @@ it, change it in both.
 `TensileDIC_Level2_tmp.py`) when the flexural pipeline was added, so the two
 pipelines' file names say which test type they handle. Nothing about their
 behaviour changed. Old notes and commit messages still use the short names.
+
+**`TensileDIC_Level2_tmp.py` is gone from this directory.** Its peak-anchored
+MTS mapping became the standard `TensileDIC_Level2.py` method, so keeping a
+near-duplicate script alongside it was a way to run two different pipelines by
+accident. The file is retired to `old/scripts/` and is no longer tracked.
 
 The standalone flexural scratch scripts — `Flexural_tmp.py` (a self-contained
 worked example of the whole bend-test chain on one coupon),
