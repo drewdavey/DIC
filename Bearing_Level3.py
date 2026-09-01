@@ -66,7 +66,7 @@ CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 # SWITCHES
 # =============================================================================
 PRINTS     = ["P01"]
-DIRECTIONS = [0, 90]          # no 45 deg bearing coupons were tested
+DIRECTIONS = [0, 90]         
 
 DO_GROUP_PLOTS = True
 DO_PRINT_STATS = True
