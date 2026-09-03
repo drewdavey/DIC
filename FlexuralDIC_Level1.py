@@ -72,15 +72,16 @@ CSV_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 # SWITCHES — which coupons, and which steps
 # =============================================================================
 PRINTS     = ["P01"]
-EXPOSURES  = {"CL": True, "IS": False}      # only CL and IS were bend-tested
+EXPOSURES  = {"CL": True, "IS": True}      # only CL and IS were bend-tested
 DIRECTIONS = {"00": True, "90": True}
 REPLICATES = ["01", "02", "03"]
+# REPLICATES = ["02", "03"]
 
 DO_LIST_VARS     = True     # Step C
 DO_EXPORT_FRAMES = True     # Step A  (~1 GB/coupon)
 OVERWRITE_FRAMES = False    # if False, skip .out files whose .csv already exists
 DO_BUILD_L1      = True     # Step B
-OVERWRITE_L1     = False    # if False, skip coupons whose per-coupon CSV exists
+OVERWRITE_L1     = True    # if False, skip coupons whose per-coupon CSV exists
 
 # =============================================================================
 # .OUT VARIABLES

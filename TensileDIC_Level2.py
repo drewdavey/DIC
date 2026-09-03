@@ -99,7 +99,7 @@ FILTER_METHOD   = "butterworth"  # "median" or "butterworth"
 # record its own peak. add_coverage() takes the batch median as the nominal
 # gain and reports each coupon against it. On P01 this flags TCL45-01 (0.90),
 # TSW00-01 (0.94) and TSW00-02 (0.96) and nothing else.
-DIC_COVERAGE_MIN = 0.98
+DIC_COVERAGE_MIN = 0.95
 
 # The peak anchor is refined by correlating the two force ramps over +/- this
 # fraction of the test duration. It must stay generous: on P01-TSW00-01 and

@@ -184,16 +184,27 @@ def load_bearing_coupons(spec_df, t_col):
         f = raw["force_N"].to_numpy()
         F_max = float(np.max(f))
 
-        # Toe correction (D953 Appendix X1): fit the 10-40 % F_max region and
-        # project back to F = 0. That x-intercept is the machine take-up.
+        # Toe correction (D638 Annex A1.3, which D790 §12.1 and this reduction
+        # both borrow): fit the linear region and project it back to F = 0.
+        # That x-intercept is the machine take-up, and all deformation is
+        # measured from it. The linear region is the 10-40 % F_max band — D953
+        # defines no modulus and so no modulus window, so a load band is what
+        # is left. mts_plots.toe_shift applies the identical band, so the two
+        # scripts correct a bearing coupon the same way.
         #
-        # Clamped at zero. A negative intercept means the fitted line reaches
-        # zero load at negative displacement, so subtracting it would ADD travel
-        # the crosshead never made and move the 4 % deformation point earlier
-        # down the curve. On P01 that happens on the three BIS00 coupons and
-        # drops their S_b to 5-7 MPa against an S_max of ~150; clamped they read
-        # 17-28 MPa, in family with the rest. There is no toe to remove here.
-        fit_m = (f >= FIT_LO * F_max) & (f <= FIT_HI * F_max)
+        # LOADING BRANCH ONLY. A1.3 constructs the continuation of the loading
+        # curve; the record runs well past peak, and those unloading points sit
+        # at large displacement with the force back inside the 10-40 % band, so
+        # including them tips the fitted line over and projects it to a NEGATIVE
+        # intercept. That is what used to happen on the three BIS00 coupons —
+        # they were being clamped to a zero toe and reading S_b = 17-28 MPa
+        # against an S_max of ~150. Fitted on the loading branch alone their toe
+        # is 0.28-0.39 mm, in family with every other coupon, and S_b lands at
+        # ~50 MPa. The clamp below is kept as a guard, but it should no longer
+        # have anything to catch.
+        i_max = int(np.argmax(f))
+        pre_peak = np.arange(len(f)) <= i_max
+        fit_m = pre_peak & (f >= FIT_LO * F_max) & (f <= FIT_HI * F_max)
         if fit_m.sum() < 3:
             continue
         slope, intercept = np.polyfit(d[fit_m], f[fit_m], 1)
@@ -202,7 +213,6 @@ def load_bearing_coupons(spec_df, t_col):
 
         # P at 4 % hole deformation (D953-19 §3.2.2): pre-peak only, made
         # monotone so np.interp is valid.
-        i_max = int(np.argmax(f))
         dc, fc = d_corr[:i_max + 1], f[:i_max + 1]
         keep = np.concatenate(([True], np.diff(np.maximum.accumulate(dc)) > 0))
         dc_m, fc_m = dc[keep], fc[keep]
